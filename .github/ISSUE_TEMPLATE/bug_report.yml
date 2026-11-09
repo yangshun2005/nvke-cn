@@ -1,0 +1,147 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Bug Report
+description: Report a bug or unexpected behavior in NVKE
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+
+body:
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Prerequisites
+      options:
+        - label: I searched existing issues and found no duplicates
+          required: true
+        - label: This is not a security vulnerability. I will report vulnerabilities to NVIDIA PSIRT as described in the [security policy](https://github.com/dsx-ai-factory/nvke/blob/main/SECURITY.md), not through a public issue or GitHub Security Advisory
+          required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: What happened and what did you expect?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact to you
+      description: Choose the option closest to your situation. Maintainers assess priority during triage.
+      options:
+        - Cannot proceed
+        - Major functionality unavailable
+        - Workaround needed
+        - Minor inconvenience
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Controller
+        - Node agent or updater
+        - nvkectl CLI
+        - Cluster API provider (provisioned)
+        - Helm charts or deployment
+        - nico-sim (development simulator)
+        - OS image or image checker
+        - NVKE telemetry pipeline (NKTP)
+        - Build, packaging, or release automation
+        - Documentation
+        - Other / Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Regression?
+      description: Did this work in a previous version?
+      options:
+        - "Yes, this worked before (please specify version below)"
+        - "No, this is a new use case"
+        - "Unknown / first time using this feature"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps or observed pattern
+      description: Provide reliable reproduction steps, or for an intermittent failure, its observed frequency and conditions.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include only the fields that apply. Redact kubeconfigs, kubeadm join commands and bootstrap tokens, SPIFFE certificates and keys, BMC/Redfish/NICo credentials, database connection strings, and sensitive internal hostnames or IPs. Rotate credentials if exposed.
+      placeholder: |
+        - NVKE version, tag, or commit:
+        - Component version (for example `nvkectl version`):
+        - Kubernetes version:
+        - Deployment environment (bare metal, CAPD, or other):
+        - OS and architecture:
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command used
+      description: Paste the exact command(s) or API request that triggered the issue. Redact credentials, tokens, and private hostnames, including tokens in URLs.
+      placeholder: |
+        ```bash
+        nvkectl create cluster ...
+        ```
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Error Output
+      description: Paste the smallest useful excerpt. Redact kubeconfigs, kubeadm join commands and bootstrap tokens, SPIFFE certificates and keys, BMC/Redfish/NICo credentials, database connection strings, and sensitive internal hostnames or IPs. Rotate credentials if exposed.
+      render: shell
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Anything else that might help (recent upgrade, related issues, or workarounds?).
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: I agree to follow the project's [Code of Conduct](https://github.com/dsx-ai-factory/nvke/blob/main/CODE_OF_CONDUCT.md)
+          required: true

@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: OS Image EFI
+
+# Builds qcow-imager.efi and uploads it as a workflow artifact. Nothing is
+# published: this proves the artifact can be built from source in this repo,
+# which it previously could not. See os-image/efi/README.md.
+#
+# Every step is a `make -C os-image/efi` target a developer runs by hand, so a
+# red run here reproduces locally. The build itself lives in
+# NVIDIA/infra-controller, pinned by commit in os-image/efi/Makefile.
+#
+# Advisory, not a merge-gate member: it needs an NVIDIA self-hosted runner and
+# takes about twenty minutes. Do not add it to merge-gate.yml.
+#
+# Both architectures. Each builds natively: the arm64 leg runs on the
+# self-hosted fleet, which is a VM with passwordless sudo, so mkosi can turn
+# off the AppArmor sysctls it needs. It used to be x86_64 only because the
+# only arm64 label available was a container-based pool with a read-only
+# /proc/sys, where arm64 could only be cross-built under qemu-user.
+on:
+  push:
+    branches:
+      - main
+      # The mirror branch, not `pull_request`: the org forbids pull_request
+      # events on self-hosted runners, and this job needs one.
+      - "pull-request/[0-9]+"
+    paths:
+      - "os-image/efi/**"
+      # Without this, a change to the lane's own definition does not run it.
+      - .github/workflows/os-image-efi.yml
+      - .github/workflows/e2e-pr-path-filter.yml
+      - hack/e2e-path-filter.py
+  workflow_dispatch:
+    inputs:
+      infra_controller_commit:
+        description: "Override the pinned NVIDIA/infra-controller commit. Empty uses the Makefile pin."
+        required: false
+        default: ""
+        type: string
+
+permissions: {}
+
+concurrency:
+  # A literal name, NOT ${{ github.workflow }}, which resolves to the caller's
+  # name inside a called workflow.
+  group: OS Image EFI-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # A mirror-branch push carries base-branch commits as well as the pull
+  # request's own, so the paths above fire for pull requests that change none
+  # of them. Read the pull request's own files first; main, the schedule and
+  # dispatch pass through.
+  changes:
+    uses: ./.github/workflows/e2e-pr-path-filter.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  build-efi:
+    needs: changes
+    if: github.repository_id == '1323115536' && needs.changes.outputs.run_e2e == 'true'
+    name: Build qcow-imager.efi (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: linux-amd64-gpu-l4-latest-1
+            target: build-efi-x86
+          - arch: aarch64
+            # ARC scale set on the RelEng EKS cluster, same size class as the
+            # arm64 label it replaces. This leg does not need /dev/kvm --
+            # mkosi builds a Unified Kernel Image -- so none of the libvirt
+            # limits in #863 apply to it. Verified: 5m34s here against 5m on
+            # the self-hosted fleet.
+            runner: arc-arm64-kvm-8c16g
+            target: build-efi-arm64
+    # Neither leg needs /dev/kvm -- mkosi builds a Unified Kernel Image and
+    # boots nothing. Both need the host shape: mkosi wants unprivileged user
+    # namespaces, which on Ubuntu means turning off two AppArmor sysctls, so
+    # the runner has to be a VM with passwordless sudo rather than a
+    # container. linux-amd64-cpu16 has a read-only /proc/sys and cannot.
+    runs-on: ${{ matrix.runner }}
+    # A cold build is about twenty minutes, half of it mkosi's own tools image.
+    # Nothing is cached between runs, so every run is cold.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare the build host
+        run: make -C os-image/efi setup-host
+
+      # Fails naming the missing piece, rather than letting mkosi fail twenty
+      # minutes in naming a keyring file.
+      - name: Check the host can build
+        run: |
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+          PATH="${HOME}/.cargo/bin:${PATH}" make -C os-image/efi check-deps
+
+      - name: Build qcow-imager.efi
+        run: |
+          make -C os-image/efi ${{ matrix.target }} \
+            ${IC_COMMIT_OVERRIDE:+IC_COMMIT="${IC_COMMIT_OVERRIDE}"}
+        env:
+          IC_COMMIT_OVERRIDE: ${{ github.event.inputs.infra_controller_commit }}
+
+      # mkosi exiting 0 having produced something that is not a bootable EFI
+      # would otherwise be uploaded and only noticed by whoever tried to boot it.
+      - name: Verify the output is a bootable EFI binary
+        run: |
+          set -euo pipefail
+          efi=os-image/efi/output/${{ matrix.arch }}/qcow-imager.efi
+          [ -s "${efi}" ] || { echo "::error::${efi} is missing or empty"; exit 1; }
+          described=$(file -b "${efi}")
+          echo "${described}"
+          # Match loosely: the two runners carry different file(1) versions and
+          # word this differently. "PE32+ executable (EFI application) x86-64"
+          # on one, "PE32+ executable for EFI (application), ARM64" on the
+          # other. Pin the two facts that matter and let the prose vary.
+          case "${{ matrix.arch }}" in
+            x86_64)  want='x86[-_]64'     ;;
+            aarch64) want='ARM64|Aarch64' ;;
+          esac
+          if ! grep -qi 'PE32+ executable' <<<"${described}" ||
+             ! grep -qi 'EFI' <<<"${described}" ||
+             ! grep -qiE "${want}" <<<"${described}"; then
+            echo "::error::${efi} is not a ${{ matrix.arch }} EFI application: ${described}"
+            exit 1
+          fi
+          sha256sum "${efi}"
+
+      - name: Upload qcow-imager.efi
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qcow-imager-efi-${{ matrix.arch }}
+          path: os-image/efi/output/${{ matrix.arch }}/qcow-imager.efi
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configuration for the DCO app — https://github.com/dcoapp/app
+#
+# The Developer Certificate of Origin is how a contributor states they have the
+# right to submit the code they are sending. `git commit -s` appends the
+# `Signed-off-by:` trailer that the check looks for. The app reads only the
+# commits in a pull request, so it never applies retroactively to history.
+#
+# Every commit from every contributor must be signed off, including NVIDIA
+# organization members. `members: true` removes the app's exemption for verified
+# org-member commits, matching CONTRIBUTING.md.
+require:
+  members: true
+
+# Let a contributor who forgot `-s` fix it with a follow-up commit instead of
+# rewriting their branch. The remediation commit has to use the app's exact
+# wording, one line per commit being signed off, each naming that commit's full
+# SHA. The failing check prints the text to copy.
+allowRemediationCommits:
+  individual: true

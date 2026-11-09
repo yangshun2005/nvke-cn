@@ -1,0 +1,203 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Anchore/Grype vulnerability scan of the checked-out tree. Results go to
+# Security -> Code scanning under the "grype" category.
+#
+# This complements govulncheck rather than repeating it. govulncheck reports
+# only what the code actually calls, in one module. Grype reads every dependency
+# manifest in the tree and reports the whole surface, which is what a consumer
+# of a released artifact is exposed to.
+#
+# Gates at critical. `only-fixed: true` hides advisories with no fixed version,
+# which are noise until upstream ships something to upgrade to -- so this gates
+# only on criticals that are actually actionable. .grype.yaml carries the known
+# findings neither scan fails on.
+#
+# The summary step renders the findings into the run. Without it the only
+# output is a count and a pointer to the Security tab, which is a different UI
+# with different permissions -- and when a scan does gate, the action prints
+# one ERROR line and no list of what failed it.
+
+name: Security Scan
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+      # Dependabot branches are mirrored to neither main nor
+      # pull-request/N, so without this line a dependency bump gets none
+      # of this check -- and a check that cannot report on a pull request
+      # cannot be required. Same list as notices-check.yml.
+      - "dependabot/**"
+  schedule:
+    - cron: '30 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Defined once so the scan and the summary below cannot disagree about what the
+# gate is. The old summary heading hardcoded "medium severity and above" and
+# would have gone stale the moment the cutoff changed.
+env:
+  GRYPE_SEVERITY_CUTOFF: critical
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started. Five merges in
+  # three minutes cancelled 18 runs across 7 workflows this way, leaving
+  # three consecutive commits on main with no test result at all.
+  #
+  # Pull-request branches keep sharing a group and still cancel, which is
+  # what you want there.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so any workflow merge-gate.yml calls would
+  # share a group with its siblings and cancel them. 8 of 9 calls died that way,
+  # reported as failures with no jobs and no error message.
+  group: Security Scan-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  grype:
+    name: grype
+    runs-on: linux-amd64-cpu16
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read          # upload-sarif reads the workflow run
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run Grype
+        id: scan
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          path: "."
+          severity-cutoff: ${{ env.GRYPE_SEVERITY_CUTOFF }}
+          output-format: sarif
+          only-fixed: true
+          config: .grype.yaml
+          fail-build: true
+
+      # Renders the findings rather than a count and a pointer elsewhere. Same
+      # reasoning as the equivalent step in image.yml: when a scan gates, the
+      # action prints one ERROR line and no list of what failed it.
+      - name: Summarise
+        if: always()
+        shell: bash
+        env:
+          CUTOFF: ${{ env.GRYPE_SEVERITY_CUTOFF }}
+        run: |
+          set -uo pipefail
+          f="${{ steps.scan.outputs.sarif }}"
+
+          if [ -z "${f}" ] || [ ! -s "${f}" ]; then
+            {
+              echo "## Grype — source tree"
+              echo
+              echo "No SARIF produced. The scan did not finish."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          {
+            echo "## Grype — source tree, fixed versions only"
+            echo
+            echo "**Total reported:** $(jq '[.runs[].results[]] | length' "${f}")"
+            echo
+            echo "| Severity | Count |"
+            echo "|---|---|"
+            jq -r '
+              [ .runs[] as $r | $r.results[] as $res
+                | ($r.tool.driver.rules[] | select(.id==$res.ruleId)) as $rule
+                | (($rule.properties["security-severity"] // "0") | tonumber) as $s
+                | if $s>=9 then "critical" elif $s>=7 then "high"
+                  elif $s>=4 then "medium" else "low" end ]
+              | group_by(.) | sort_by(-(.[0]|
+                  if .=="critical" then 4 elif .=="high" then 3
+                  elif .=="medium" then 2 else 1 end))
+              | map("| \(.[0]) | \(length) |") | .[]' "${f}"
+            echo
+
+            echo "### Findings at or above the \`${CUTOFF}\` gate"
+            echo
+            jq -r --arg cutoff "${CUTOFF}" '
+              ($cutoff | if .=="critical" then 9 elif .=="high" then 7
+                         elif .=="medium" then 4 else 0 end) as $min
+              | [ .runs[] as $r | $r.results[] as $res
+                  | ($r.tool.driver.rules[] | select(.id==$res.ruleId)) as $rule
+                  | (($rule.properties["security-severity"] // "0") | tonumber) as $sev
+                  | select($sev >= $min)
+                  | { pkg:   (($rule.help.text // "") | capture("Package: (?<v>.*)").v // "?"),
+                      ver:   (($rule.help.text // "") | capture("Version: (?<v>.*)").v // "?"),
+                      fix:   (($rule.help.text // "") | capture("Fix Version: (?<v>.*)").v // "none"),
+                      id:    $res.ruleId,
+                      where: ($res.locations[0].physicalLocation.artifactLocation.uri // "?") } ]
+              | unique
+              | if length == 0 then "None — the gate passed."
+                else (["| Package | Version | Fixed in | ID | Where |","|---|---|---|---|---|"]
+                      + map("| \(.pkg) | \(.ver) | \(.fix) | \(.id) | `\(.where)` |")
+                      | join("\n"))
+                end' "${f}"
+            echo
+            echo "Full set in **Security -> Code scanning**, category \`grype\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload SARIF
+        if: always() && steps.scan.outputs.sarif != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+          category: grype
+
+      # The scan above honours .grype.yaml but never says whether the entries in
+      # it still match anything. An entry whose upstream has shipped a fix
+      # suppresses nothing, and a no-op entry is what hides the next real
+      # finding: it stays in the file, nobody is forced to look at it, and the
+      # day the same package gets a new advisory it is already excused.
+      #
+      # Only entries declaring `scope=source` or `scope=both` are judged here.
+      # The image scan in image.yml judges the rest; neither scan sees the
+      # other's packages, so neither can call the other's entries dead.
+      #
+      # Everything else the ignore list has to satisfy -- one advisory, one
+      # package, a real owner, an unexpired review date -- is file reading, and
+      # is checked in the merge gate by go-build.yml. This job is only for the
+      # part that needs a scanner.
+      #
+      # Skipped entirely while the list is empty, which is the normal state, so
+      # this costs a second scan only once there is something to check.
+      - name: Count the ignore entries
+        id: ignore
+        if: always()
+        run: echo "count=$(./hack/grype-ignore-check.sh --count)" >> "${GITHUB_OUTPUT}"
+
+      # A second pass, in JSON, because the SARIF above omits suppressed matches
+      # entirely -- they are exactly what this needs to read. No cutoff and no
+      # only-fixed filter, unlike the gating scan: an entry covering an advisory
+      # with no fix available is still an entry that has to be matching
+      # something, and `only-fixed: true` would hide it and call it stale.
+      - name: Re-scan for suppressed findings
+        id: suppressed
+        if: always() && steps.ignore.outputs.count != '0'
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          path: "."
+          severity-cutoff: negligible
+          output-format: json
+          only-fixed: false
+          config: .grype.yaml
+          fail-build: false
+
+      - name: Check every source-scoped exception still suppresses a finding
+        if: always() && steps.ignore.outputs.count != '0'
+        run: ./hack/grype-ignore-check.sh --applied source "${{ steps.suppressed.outputs.json }}"

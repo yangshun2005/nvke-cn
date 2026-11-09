@@ -1,0 +1,150 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Builds every command in the Go workspace and throws the binaries away.
+#
+# The value is the compile check, not the artifact: until now nothing built the
+# agent or the two hack controllers on a pull request, so a change that did not
+# compile could merge and only fail later in a release or an image build.
+#
+# Runs on ubuntu-latest with `pull_request`, deliberately. Every module in
+# go.work — all eleven, including controller, nico-sim, os-image, and nvkectl — resolves
+# public dependencies through the Go module cache, so this needs no NVIDIA
+# runner or credentials -- which means it also runs on fork pull requests
+# and on Dependabot's, where the repository currently has almost no coverage.
+name: Go Build
+
+# workflow_call is what merge-gate.yml uses to call this as a reusable workflow.
+# Its own `pull_request:` trigger is gone: pull requests reach it through the
+# gate, so it runs once per pull request rather than twice.
+#
+# A called workflow does not apply its own `paths:` filter, so on a pull request
+# this runs whatever changed. That is deliberate -- see the note in
+# merge-gate.yml. The filter below still applies to `push`.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.go'
+      - '**/go.mod'
+      - '**/go.sum'
+      - 'go.work'
+      - 'go.work.sum'
+      - 'Makefile'
+      - '.github/workflows/go-build.yml'
+  workflow_call:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started. Five merges in
+  # three minutes cancelled 18 runs across 7 workflows this way, leaving
+  # three consecutive commits on main with no test result at all.
+  #
+  # Pull-request branches keep sharing a group and still cancel, which is
+  # what you want there.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so every workflow merge-gate.yml calls would
+  # compute the same group and cancel each other -- 8 of 9 calls died that way,
+  # reported to the gate as failures with no jobs and no error message.
+  group: Go Build-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  # Do not cancel a run on main; the newer workflows here all guard this.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    # 25, not 15: over 7 days on main the job averaged 13.1m and 3 of 38 runs
+    # were cut at 15m, which reports as cancelled rather than failed.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # go.work carries the highest Go version of any member module, so the
+      # toolchain it selects satisfies all of them.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache: true
+          # go.work.sum holds only the hashes NOT already in a member's go.sum,
+          # so the versions actually linked often appear in it zero times. Keyed
+          # on it alone, a dependency bump leaves the key unchanged and restores
+          # a stale cache.
+          cache-dependency-path: |
+            go.work.sum
+            **/go.sum
+
+      # version-check builds, then asks each binary for its version and fails on
+      # a placeholder. The linker drops an -X for a symbol the binary lacks
+      # without a word, so a renamed variable is otherwise invisible until a
+      # release reports "dev".
+      #
+      # The checkout above is shallow and has no tags, so `git describe --tags`
+      # finds nothing and the version falls back to the commit. That passes.
+      # go.work owns the Go version; the Dockerfiles and the Flox manifest
+      # cannot derive it, so this is what notices when a hand-kept copy drifts.
+      # Reads files only, so it is safe for a fork pull request.
+      - name: Check the Go version copies agree with go.work
+        run: make go-version-check
+
+      # make/tool-versions.mk owns every tool pin. This is what notices a
+      # second declaration of one, which is the only way two can disagree.
+      # Reads files only, so it is safe for a fork pull request.
+      - name: Check every tool pin is declared once
+        run: make tool-version-check
+
+      # The two images this repository publishes build from base images named
+      # by digest. Reads files only, so it is safe for a fork pull request.
+      - name: Check release-relevant base images are digest-pinned
+        run: make base-image-check
+
+      # The grype scans themselves need a vulnerability database, a network and
+      # an NVIDIA runner, so they are not in the merge gate and do not run on a
+      # fork pull request. The policy their ignore list has to satisfy is pure
+      # file reading, so it is checked here, where it gates the pull request
+      # that adds the entry rather than the weekly scan long afterwards.
+      - name: Check .grype.yaml exceptions are scoped, owned and in date
+        run: make grype-ignore-check
+
+      - name: Check every deploy-list item has its directory
+        run: make deploy-lists-check
+
+      - name: Build
+        run: make version-check
+
+      # -race like controller-test.yml:133-135. The provisioned provider is a
+      # controller-runtime reconciler, so it is concurrent by construction.
+      - name: Test OS-image checker
+        env:
+          CGO_ENABLED: "1"
+          GO_TEST_FLAGS: -race
+        run: make -C os-image test
+
+      - name: Test provisioned infrastructure provider
+        env:
+          CGO_ENABLED: "1"
+          GO_TEST_FLAGS: -race
+        run: make -C cluster-api-provider-provisioned test
+
+      # Likewise the release module's only unit-test lane. This is what makes
+      # TestRepositoryFilesAreValid a merge-gate check rather than a test
+      # someone has to remember to run: it loads release/registry.yaml,
+      # policy.yaml and qualification.yaml, so a selector naming a capability no
+      # stream declares fails here.
+      # No -race -- the planner is sequential and reads git tags through one
+      # subprocess at a time.
+      - name: Test release qualification tooling
+        run: make -C release test

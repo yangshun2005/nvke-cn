@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: "1.0"
+project: "cloud-workflow-engine"
+last_updated: "2026-09-01T00:00:00Z"
+
+repository_exposure_classification:
+  visibility: "Public"
+  basis: "repository is published at github.com/dsx-ai-factory/nvke under the Apache-2.0 license"
+  confirmed_by: "NVKE maintainers (see MAINTAINERS.md)"
+  date: "2026-09-01"
+
+service_exposure_classification:
+  tier: "Sensitive"
+  confidence: "high"
+  basis: "orchestration service that handles credentials, privileged cluster and node lifecycle operations, and security identity material; intended for trusted management-plane deployment, not public exposure"
+  confirmed_by: "NVKE maintainers (see MAINTAINERS.md)"
+  date: "2026-09-01"
+
+false_positives: []
+accepted_risks: []
+suppressed_cves: []

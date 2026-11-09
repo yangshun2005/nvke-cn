@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Regenerates THIRD_PARTY_NOTICES.md and fails if it differs from the committed
+# copy, so a dependency change cannot land without refreshed attribution.
+#
+# Deliberately not filtered on changed paths. The inventory is the import
+# closure of the released commands, so it moves when an ordinary .go file
+# changes its imports, not only when go.mod moves. A path filter would pass
+# green while the committed file went stale, and the failure would then surface
+# on main rather than on the pull request that caused it.
+
+name: Third-Party Notices
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+      # Dependabot pushes to a branch in this repository, which matches neither
+      # of the two above, so this check has never run on a dependency bump --
+      # the one kind of pull request most likely to stale the file. The failure
+      # then surfaced on main after the merge, which is exactly how syscmp's
+      # main went red on 2026-08-12. The other three repositories closed this
+      # elsewhere; nke was assumed covered by its pull_request-triggered
+      # workflows, but only three of its twelve are, and this is not one.
+      #
+      # This repository does not dispatch unvetted pull_request jobs to the
+      # NVIDIA runner pool, so this self-hosted job cannot switch triggers. It
+      # has to name the trusted Dependabot branch directly.
+      - "dependabot/**"
+  # Called by merge-gate.yml, which is what makes this required. Before that it
+  # was the only one of the four generated-artifact checks that could not block
+  # a merge: an unvetted author never reached the mirror branch, so drift
+  # landed on main and surfaced there, which is how syscmp's main went red on
+  # 2026-08-12. The push triggers above stay, so main and dependabot branches
+  # still get their own run.
+  workflow_call:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started. Five merges in
+  # three minutes cancelled 18 runs across 7 workflows this way, leaving
+  # three consecutive commits on main with no test result at all.
+  #
+  # Pull-request branches keep sharing a group and still cancel, which is
+  # what you want there.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so any workflow merge-gate.yml calls would
+  # share a group with its siblings and cancel them. 8 of 9 calls died that way,
+  # reported as failures with no jobs and no error message.
+  group: Third-Party Notices-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  # Do not cancel a run on main: back-to-back merges would otherwise
+  # discard this check's result for the intermediate commit, leaving a
+  # commit on main that nothing ever verified. Same guard as the other
+  # workflows here.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Module targets set their own workspace mode. A module fetch the proxy drops
+# mid-stream falls back to the module's origin (#1481).
+env:
+  GOWORK: "off"
+  GOPROXY: https://proxy.golang.org|direct
+
+jobs:
+  notices-check:
+    name: Check THIRD_PARTY_NOTICES.md is up to date
+    # ubuntu-latest, not the self-hosted pool: a required gate member must run
+    # for a fork author, and this job needs no secret and no NVIDIA network --
+    # checkout, setup-go, and go-licenses over public modules. It
+    # took 47-53s on the 16-CPU pool, so the hosted runner has room.
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            **/go.sum
+
+      # The root target owns the list of redistributed binaries.
+      - name: Verify THIRD_PARTY_NOTICES.md files
+        run: make notices-check

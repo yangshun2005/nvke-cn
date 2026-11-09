@@ -1,0 +1,260 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package nodes_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
+	"github.com/dsx-ai-factory/nvke/controller/internal/clients/shared"
+	"github.com/dsx-ai-factory/nvke/controller/internal/db"
+	"github.com/dsx-ai-factory/nvke/controller/internal/nodes"
+	"github.com/dsx-ai-factory/nvke/controller/internal/testutil"
+)
+
+// nicoNode builds a node as a stored row looks: the instance type the scheduler
+// chose lives in the nested nico payload, not at the row root.
+func nicoNode(instanceTypeID uuid.UUID) db.Node {
+	node := db.Node{}
+	node.SetNico(db.NicoNodeProvider{InstanceTypeID: instanceTypeID})
+	return node
+}
+
+func TestGetNodeContext_NoNodePoolControlPlane(t *testing.T) {
+	ctx := context.Background()
+	bunDB := testutil.SetupDB(ctx, t,
+		(*db.Cluster)(nil),
+		(*db.ControlPlaneConfiguration)(nil),
+		(*db.Node)(nil),
+	)
+	database := db.NewDB(bunDB)
+
+	siteID := uuid.New()
+	cluster := db.Cluster{
+		ID:                uuid.New(),
+		Name:              "cp-cluster",
+		KubernetesVersion: "1.31.0",
+		TeleportEnabled:   true,
+		ProviderType:      db.ProviderTypeNico,
+		Nico: &db.NicoClusterProvider{
+			SiteID: siteID,
+			OrgID:  "test-org",
+			VpcID:  uuid.New(),
+		},
+	}
+	_, err := database.CreateCluster(ctx, &cluster)
+	require.NoError(t, err)
+
+	var snapshotCfg db.ControlPlaneConfigSpec
+	snapshotCfg.KubeReservedMemory = "250Mi"
+	snapshotCfg.TeleportEnabled = true
+	snapshotCfg.ProvisioningMonitorDisabled = true
+	// Empty DiskSelectionStrategy: ControlPlaneConfigNodeContext defaults it to smallest
+	// when populating the synthetic NodeSet Nico payload.
+	snapshotCfg.SetNico(db.NicoControlPlaneProvider{
+		Release:               "os",
+		ConfigProfile:         "cfg",
+		DiskSelectionStrategy: "",
+	})
+	snapshot, err := database.CreateControlPlaneConfiguration(ctx, &db.ControlPlaneConfiguration{
+		ClusterID: cluster.ID,
+		Config:    snapshotCfg,
+	})
+	require.NoError(t, err)
+	cluster.ControlPlaneConfig.ConfigurationID = snapshot.ID
+	_, err = database.UpdateCluster(ctx, &cluster)
+	require.NoError(t, err)
+
+	instanceTypeID := uuid.New()
+	node := db.Node{
+		ID:                     uuid.New(),
+		SpireAttestationMethod: db.SpireAttestationMethodTPM,
+		ClusterID:              cluster.ID,
+		ControlPlane:           true,
+		Name:                   "cp-1",
+		IP:                     "10.0.0.1",
+	}
+	node.SetNico(db.NicoNodeProvider{InstanceTypeID: instanceTypeID})
+	_, err = database.CreateNode(ctx, &node)
+	require.NoError(t, err)
+
+	nodeSet, nodePool, err := nodes.GetNodeContext(ctx, database, node)
+	require.NoError(t, err)
+	assert.Equal(t, uuid.Nil, nodeSet.ID)
+	assert.Equal(t, uuid.Nil, nodePool.ID)
+	nicoNodeSetProvider, err := nodeSet.NicoProvider()
+	require.NoError(t, err)
+	assert.Equal(t, db.DiskSelectionStrategySmallest, nicoNodeSetProvider.DiskSelectionStrategy)
+	nicoNodePoolProvider, err := nodePool.NicoProvider()
+	require.NoError(t, err)
+	assert.Equal(t, db.DiskSelectionStrategySmallest, nicoNodePoolProvider.DiskSelectionStrategy)
+	assert.Equal(t, cluster.ID, nodePool.ClusterID)
+	assert.True(t, nodePool.ControlPlane)
+	assert.True(t, nodePool.TeleportEnabled)
+	assert.True(t, nodePool.ProvisioningMonitorDisabled)
+	assert.Equal(t, instanceTypeID, nicoNodePoolProvider.InstanceTypeID)
+	assert.Equal(t, "250Mi", nodeSet.KubeReservedMemory)
+	assert.Equal(t, "250Mi", nodePool.KubeReservedMemory)
+}
+
+func TestControlPlaneConfigNodeContext_UsesSnapshotDiskStrategyOverride(t *testing.T) {
+	node := nicoNode(uuid.New())
+	var snapshotCfg db.ControlPlaneConfigSpec
+	snapshotCfg.KubeReservedMemory = "250Mi"
+	snapshotCfg.SetNico(db.NicoControlPlaneProvider{
+		Release:               "os",
+		ConfigProfile:         "cfg",
+		DiskSelectionStrategy: db.DiskSelectionStrategyLargest,
+	})
+	cluster := db.Cluster{
+		ID:           uuid.New(),
+		ProviderType: db.ProviderTypeNico,
+		ControlPlaneConfig: db.ControlPlaneConfig{
+			MaxSurge: 1,
+		},
+	}
+
+	nodeSet, nodePool, err := nodes.ControlPlaneConfigNodeContext(cluster, node, snapshotCfg)
+	require.NoError(t, err)
+
+	nicoNodeSetProvider, err := nodeSet.NicoProvider()
+	require.NoError(t, err)
+	assert.Equal(t, db.DiskSelectionStrategyLargest, nicoNodeSetProvider.DiskSelectionStrategy)
+
+	nicoNodePoolProvider, err := nodePool.NicoProvider()
+	require.NoError(t, err)
+	assert.Equal(t, db.DiskSelectionStrategyLargest, nicoNodePoolProvider.DiskSelectionStrategy)
+	assert.Equal(t, "250Mi", nodeSet.KubeReservedMemory)
+	assert.Equal(t, "250Mi", nodePool.KubeReservedMemory)
+}
+
+func TestControlPlaneConfigNodeContext_PreservesNicoProviderPayload(t *testing.T) {
+	cluster := db.Cluster{ID: uuid.New(), ProviderType: db.ProviderTypeNico}
+	node := nicoNode(uuid.New())
+	subnetID := uuid.New()
+	sshKeyGroupID := uuid.New()
+
+	var snapshotCfg db.ControlPlaneConfigSpec
+	snapshotCfg.SetNico(db.NicoControlPlaneProvider{
+		Release:               "os",
+		ConfigProfile:         "cfg",
+		DiskSelectionStrategy: db.DiskSelectionStrategyLargest,
+		SubnetIDs:             []uuid.UUID{subnetID},
+		SSHKeyGroupIDs:        []uuid.UUID{sshKeyGroupID},
+	})
+
+	nodeSet, nodePool, err := nodes.ControlPlaneConfigNodeContext(cluster, node, snapshotCfg)
+	require.NoError(t, err)
+
+	nicoNodeSetProvider, err := nodeSet.NicoProvider()
+	require.NoError(t, err)
+	assert.Equal(t, "os", nicoNodeSetProvider.Release)
+	assert.Equal(t, "cfg", nicoNodeSetProvider.ConfigProfile)
+	assert.Equal(t, db.DiskSelectionStrategyLargest, nicoNodeSetProvider.DiskSelectionStrategy)
+	assert.Equal(t, []uuid.UUID{subnetID}, nicoNodeSetProvider.SubnetIDs)
+
+	nicoNodePoolProvider, err := nodePool.NicoProvider()
+	require.NoError(t, err)
+	assert.Equal(t, node.NicoInstanceTypeID(), nicoNodePoolProvider.InstanceTypeID)
+	assert.Equal(t, "os", nicoNodePoolProvider.Release)
+	assert.Equal(t, "cfg", nicoNodePoolProvider.ConfigProfile)
+	assert.Equal(t, db.DiskSelectionStrategyLargest, nicoNodePoolProvider.DiskSelectionStrategy)
+	assert.Equal(t, []uuid.UUID{subnetID}, nicoNodePoolProvider.SubnetIDs)
+	assert.Equal(t, []uuid.UUID{sshKeyGroupID}, nicoNodePoolProvider.SSHKeyGroupIDs)
+}
+
+func TestControlPlaneConfigNodeContext_PreservesCapiProviderPayload(t *testing.T) {
+	cluster := db.Cluster{ID: uuid.New(), ProviderType: db.ProviderTypeCAPI}
+	node := nicoNode(uuid.New())
+
+	var snapshotCfg db.ControlPlaneConfigSpec
+	snapshotCfg.SetCapi(db.CAPIControlPlaneProvider{
+		SpireAttestationMethod: db.SpireAttestationMethodJoinToken,
+		PreKubeadmCommands:     []string{"echo hi"},
+		BootstrapFiles:         []db.CloudInitFile{{Path: "/etc/test", Content: "ok"}},
+	})
+
+	nodeSet, nodePool, err := nodes.ControlPlaneConfigNodeContext(cluster, node, snapshotCfg)
+	require.NoError(t, err)
+
+	capiNodeSetProvider, err := nodeSet.CAPIProvider()
+	require.NoError(t, err)
+	assert.Equal(t, db.SpireAttestationMethodJoinToken, capiNodeSetProvider.SpireAttestationMethod)
+	assert.Equal(t, []string{"echo hi"}, capiNodeSetProvider.PreKubeadmCommands)
+	assert.Equal(t, []db.CloudInitFile{{Path: "/etc/test", Content: "ok"}}, capiNodeSetProvider.BootstrapFiles)
+
+	capiNodePoolProvider, err := nodePool.CAPIProvider()
+	require.NoError(t, err)
+	assert.Equal(t, db.SpireAttestationMethodJoinToken, capiNodePoolProvider.SpireAttestationMethod)
+	assert.Equal(t, []string{"echo hi"}, capiNodePoolProvider.PreKubeadmCommands)
+	assert.Equal(t, []db.CloudInitFile{{Path: "/etc/test", Content: "ok"}}, capiNodePoolProvider.BootstrapFiles)
+
+	// A CAPI cluster never populates a Nico payload, regardless of what the
+	// snapshot carries.
+	_, err = nodeSet.NicoProvider()
+	require.Error(t, err)
+	_, err = nodePool.NicoProvider()
+	require.Error(t, err)
+}
+
+func TestControlPlaneConfigNodeContext_DefaultsDiskStrategy(t *testing.T) {
+	node := nicoNode(uuid.New())
+	var snapshotCfg db.ControlPlaneConfigSpec
+	snapshotCfg.SetNico(db.NicoControlPlaneProvider{
+		Release:               "os",
+		ConfigProfile:         "cfg",
+		DiskSelectionStrategy: "",
+	})
+	cluster := db.Cluster{ID: uuid.New(), ProviderType: db.ProviderTypeNico}
+
+	nodeSet, nodePool, err := nodes.ControlPlaneConfigNodeContext(cluster, node, snapshotCfg)
+	require.NoError(t, err)
+
+	nicoNodeSetProvider, err := nodeSet.NicoProvider()
+	require.NoError(t, err)
+	assert.Equal(t, db.DiskSelectionStrategySmallest, nicoNodeSetProvider.DiskSelectionStrategy)
+
+	nicoNodePoolProvider, err := nodePool.NicoProvider()
+	require.NoError(t, err)
+	assert.Equal(t, db.DiskSelectionStrategySmallest, nicoNodePoolProvider.DiskSelectionStrategy)
+}
+
+func TestControlPlaneConfigNodeContext_MachineMetadata(t *testing.T) {
+	for _, provider := range []db.ProviderType{db.ProviderTypeNico, db.ProviderTypeCAPI} {
+		t.Run(string(provider), func(t *testing.T) {
+			cluster := db.Cluster{Name: "cluster-a", ProviderType: provider}
+			node := nicoNode(uuid.New())
+			node.Name = "cp-0"
+			node.ControlPlane = true
+			snapshot := db.ControlPlaneConfigSpec{
+				KubernetesVersion:  "1.32.1",
+				MachineAnnotations: map[string]string{"example.com/setup": "gpu,network"},
+				MachineLabels:      map[string]string{"example.com/pool": "control-plane"},
+			}
+			if provider == db.ProviderTypeNico {
+				snapshot.SetNico(db.NicoControlPlaneProvider{})
+			} else {
+				snapshot.SetCapi(db.CAPIControlPlaneProvider{})
+			}
+			set, pool, err := nodes.ControlPlaneConfigNodeContext(cluster, node, snapshot)
+			require.NoError(t, err)
+			machine, err := shared.BuildMachine(node, set, pool, cluster, "nke-system", "bootstrap", clusterv1.ContractVersionedObjectReference{
+				APIGroup: "infrastructure.cluster.x-k8s.io", Kind: "TestMachine", Name: node.Name,
+			})
+			require.NoError(t, err)
+			require.Equal(t, "gpu,network", machine.Annotations["example.com/setup"])
+			require.Equal(t, "control-plane", machine.Labels["example.com/pool"])
+			require.Contains(t, machine.Labels, clusterv1.MachineControlPlaneLabel)
+			pool.MachineAnnotations["example.com/setup"] = "changed"
+			pool.MachineLabels["example.com/pool"] = "changed"
+			require.Equal(t, "gpu,network", snapshot.MachineAnnotations["example.com/setup"])
+			require.Equal(t, "control-plane", snapshot.MachineLabels["example.com/pool"])
+		})
+	}
+}

@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+hooks:
+  beforeJoinNode:
+    - runbook:
+        name: disable-ipv6-grub
+    - runbook:
+        name: disable-ipv6-sysctl
+    - runbook:
+        name: configure-inotify
+    - runbook:
+        name: enable-ipv4-forward
+    - runbook:
+        name: disable-swap
+    - runbook:
+        name: install-chrony
+    - runbook:
+        name: lvextend
+  afterJoinNode:
+    - runbook:
+        name: remove-ovn-requests
+
+# The fleet reboots before join so disable-ipv6-grub takes effect; the lane skips
+# the 1-2 min per node and the reboot spec still exercises a reboot.
+preJoinNodeReboot: false

@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Feature Request
+description: Suggest a new feature or an improvement to NVKE
+title: "[Feature]: "
+labels: ["feature", "needs-triage"]
+
+body:
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Prerequisites
+      options:
+        - label: I searched existing issues and discussions for similar proposals
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Feature Summary
+      description: Brief description of the feature
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem/Use Case
+      description: What problem does this solve? Describe the operator or developer problem, who it affects, and why current behavior is insufficient.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the outcome and user-visible behavior you want. Implementation details are optional.
+    validations:
+      required: true
+
+  - type: textarea
+    id: success
+    attributes:
+      label: Success Criteria
+      description: What does “done” look like? How should we measure success?
+      placeholder: |
+        - Must support ...
+        - Must not break ...
+        - CLI/API output should ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What other options/workarounds have you tried or considered?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Controller
+        - Node agent or updater
+        - nvkectl CLI
+        - Cluster API provider (provisioned)
+        - Helm charts or deployment
+        - nico-sim (development simulator)
+        - OS image or image checker
+        - NVKE telemetry pipeline (NKTP)
+        - Build, packaging, or release automation
+        - Documentation
+        - Cross-component / Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: requester_impact
+    attributes:
+      label: Impact to you
+      description: Choose the option closest to your situation. Maintainers assess priority during triage.
+      options:
+        - Blocking adoption or a major use case
+        - Important (would improve my workflow)
+        - Nice to have
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility / Breaking Changes
+      description: Any expected breaking changes, migrations, API compatibility, or versioning concerns?
+    validations:
+      required: false
+
+  - type: textarea
+    id: ops
+    attributes:
+      label: Operational Considerations
+      description: Observability, upgrades, security boundaries, multi-tenancy, blast radius. Report suspected vulnerabilities to NVIDIA PSIRT through the [security policy](https://github.com/dsx-ai-factory/nvke/blob/main/SECURITY.md), not in a public feature request.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Are you willing to contribute?
+      description: See [CONTRIBUTING.md](https://github.com/dsx-ai-factory/nvke/blob/main/CONTRIBUTING.md) for contribution guidance.
+      options:
+        - Yes, I can open a PR
+        - Maybe, with guidance
+        - "No"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: I agree to follow the project's [Code of Conduct](https://github.com/dsx-ai-factory/nvke/blob/main/CODE_OF_CONDUCT.md)
+          required: true

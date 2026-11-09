@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# actionlint fails on any runs-on label it does not know. Without this file it
+# reports every workflow that uses a self-hosted runner as broken, which is all
+# of them except tag-publish.yml, and that makes it useless locally.
+
+self-hosted-runner:
+  labels:
+    - linux-amd64-cpu4
+    - linux-amd64-cpu8
+    - linux-amd64-cpu16
+    - linux-arm64-cpu16
+    - linux-amd64-gpu-l4-latest-1
+    # Scale sets on the RelEng EKS cluster (dgxc-eks-use1-rel-prd1).
+    # Both amd64 CPU sizes share one node pool. Only the *-kvm classes run on
+    # bare metal with /dev/kvm.
+    - arc-amd64-cpu8
+    - arc-amd64-cpu16
+    - arc-amd64-kvm
+    - arc-arm64-cpu16
+    - arc-arm64-kvm
+    - arc-arm64-kvm-8c16g
+    # Its own single-node pool, not a size on a shared one: the
+    # tpm_vtpm_proxy module that gives it /dev/vtpmx cannot be loaded on a
+    # node the CAPD lanes run on, since a TPM there makes swtpm emit an EK
+    # certificate SPIRE refuses. nvkectl-bootstrap-e2e is the only consumer.
+    - arc-arm64-vtpm
+
+paths:
+  .github/workflows/agent-deb-publish.yml:
+    ignore:
+      # actionlint 1.7.12 lacks cache-mode support; lint-workflows validates read-only values.
+      - '^unexpected key "cache-mode" for "job" section\.'

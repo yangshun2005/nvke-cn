@@ -1,0 +1,289 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("ext://uibutton", "cmd_button", "text_input")
+
+CAPNICO_PROVIDER_RESOURCE = "capnico-provider"
+CAPNICO_CREDENTIALS_RESOURCE = "capnico-credentials"
+CAPNICO_NAMESPACE = "capnico-system"
+CAPNICO_RELEASE = "capi-provider-nico"
+CAPNICO_IMAGE = "cluster-api-provider-nico:local"
+
+NICO_KIND_NODE_IMAGE_RESOURCE = "nico-kind-node-image"
+DEFAULT_NICO_ORG_ID = "novxwn552ssc"
+DEFAULT_NICO_TOKEN = "nico-simctl-token"
+
+def _get_kind_cluster_name():
+    name = os.getenv("KIND_CLUSTER_NAME", "")
+    if name:
+        return name
+    context = k8s_context()
+    if context.startswith("kind-"):
+        return context[5:]
+    return "kind-cluster-name-not-set"
+
+def _capnico_source_dir(ctx):
+    source_dir = os.getenv("CAPNICO_SOURCE_DIR", ctx.cfg.get("capnico_source_dir", ""))
+    if source_dir and not source_dir.startswith("/"):
+        source_dir = os.path.abspath(os.path.join(ctx.main_dir, source_dir))
+    return source_dir
+
+def _nico_config(ctx):
+    cfg = ctx.cfg.get("nico", {})
+    if type(cfg) != "dict":
+        fail("tilt_config.json field 'nico' must be an object")
+
+    endpoint = os.getenv("NICO_ENDPOINT", cfg.get("endpoint", "")).rstrip("/")
+    if endpoint and not (endpoint.startswith("http://") or endpoint.startswith("https://")):
+        fail("nico.endpoint must start with http:// or https://")
+
+    return struct(
+        endpoint=endpoint,
+        org_id=os.getenv("NICO_ORG_ID", cfg.get("org_id", DEFAULT_NICO_ORG_ID)),
+        token=os.getenv("NICO_TOKEN", DEFAULT_NICO_TOKEN),
+        api_name=os.getenv("NICO_API_NAME", cfg.get("api_name", "forge")),
+        environment=cfg.get("environment", "test"),
+    )
+
+def _register_node_image(ctx, labels):
+    configured_agent_dir = ctx.cfg.get("node_agent_source_dir", "")
+    agent_dir = configured_agent_dir or os.path.join(ctx.main_dir, "..", "agent")
+    if not agent_dir.startswith("/"):
+        agent_dir = os.path.abspath(os.path.join(ctx.main_dir, agent_dir))
+    local_agent_available = os.path.exists(os.path.join(agent_dir, "Makefile"))
+    if configured_agent_dir and not local_agent_available:
+        fail("node_agent_source_dir does not contain an NVKE agent checkout: %s" % agent_dir)
+    dsx_imds_enabled = "dsx-imds-attestation" in ctx.provider_names
+    dsx_imds_agent_plugin = os.path.join(
+        ctx.main_dir,
+        ".local",
+        "dsx-imds-attestation",
+        "dsx-imds-node-attestor-agent",
+    )
+    install_cni_after_init = "true" if os.getenv(
+        "INSTALL_CNI_AFTER_INIT", ctx.tilt_env.get("INSTALL_CNI_AFTER_INIT", "true")) == "true" else "false"
+    build_environment = {"INSTALL_CNI_AFTER_INIT": install_cni_after_init}
+    resource_deps = ["check-management-cluster"]
+    if dsx_imds_enabled:
+        # TPM mode starts the Colima-backed swtpm; the separately supplied DSX
+        # plugin remains in the image for nodes created after a mode switch.
+        image_mode = ctx.cfg.get("node_image_attestation_method", "")
+        if image_mode not in ["tpm", "dsxImds"]:
+            fail("node_image_attestation_method must be tpm or dsxImds when dsx-imds-attestation is enabled")
+        if image_mode == "dsxImds" and ctx.cfg.get("controller_attestation_method", "dsxImds") == "tpm":
+            fail("node_image_attestation_method must be tpm when controller_attestation_method is tpm")
+        build_environment["CAPD_SPIRE_ATTESTATION_METHOD"] = image_mode
+        build_environment["DSX_IMDS_AGENT_PLUGIN_PATH"] = dsx_imds_agent_plugin
+        resource_deps.append("dsx-imds-agent-plugin")
+    if dsx_imds_enabled and "dsx-identity-exchange" in ctx.provider_names:
+        ca_bundle = os.path.join(ctx.main_dir, ".local/dsx-identity-exchange/ca.crt")
+        build_environment["DSX_IDENTITY_CA_BUNDLE_PATH"] = ca_bundle
+        resource_deps.append("dsx-identity-exchange-ca")
+    if configured_agent_dir:
+        build_environment["CAPD_NODE_AGENT_LOCAL_BUILD"] = "true"
+        build_environment["NODE_AGENT_REPO_PATH"] = agent_dir
+
+    script = """
+          set -euo pipefail
+          if [ "${CAPD_KINDEST_NODE_IMAGE_PREBUILT:-false}" = "true" ]; then
+            echo "reusing prebuilt ${CAPD_KINDEST_NODE_IMAGE:-cwe-capd-kindest-node:local}"
+          else
+            make -C "%s" capd-image
+          fi
+    """ % ctx.main_dir
+
+    image_deps = [
+        os.path.join(ctx.main_dir, "Makefile"),
+        os.path.join(ctx.main_dir, "Makefile.dev"),
+        os.path.join(ctx.main_dir, "hack", "capd-kindest-node"),
+    ]
+    if local_agent_available:
+        image_deps += [
+            os.path.join(agent_dir, "Makefile"),
+            os.path.join(agent_dir, "go.mod"),
+            os.path.join(agent_dir, "go.sum"),
+            os.path.join(agent_dir, "cmd"),
+            os.path.join(agent_dir, "internal"),
+            os.path.join(agent_dir, "pkg"),
+            os.path.join(agent_dir, "scripts"),
+        ]
+
+    local_resource(
+        NICO_KIND_NODE_IMAGE_RESOURCE,
+        labels=labels,
+        cmd=["bash", "-c", script],
+        env=build_environment,
+        resource_deps=resource_deps,
+        deps=image_deps,
+        allow_parallel=True,
+    )
+
+def _nico_sim_backends(ctx):
+    raw = ctx.cfg.get("nico_sim_backends", ["container"])
+
+    if type(raw) == "string":
+        raw = [raw]
+    if type(raw) != "list":
+        fail("tilt_config.json field 'nico_sim_backends' must be a string or list")
+
+    backends = []
+    for backend in raw:
+        normalized = str(backend)
+        if normalized != "container" and normalized != "vm":
+            fail("tilt_config.json field 'nico_sim_backends' supports only 'container' and 'vm' (got %s)" % backend)
+        if normalized not in backends:
+            backends.append(normalized)
+
+    if len(backends) == 0:
+        fail("tilt_config.json field 'nico_sim_backends' must include at least one backend")
+
+    return backends
+
+def _nico_sim_endpoint_host(ctx):
+    default_host = ctx.kind_host_ip
+    host_os = str(local("uname -s", quiet=True, echo_off=True)).strip()
+    if host_os == "Darwin":
+        default_host = "host.docker.internal"
+
+    return os.getenv("NICO_SIM_ENDPOINT_HOST", default_host)
+
+def _register_nico_sim(ctx, labels, nico, endpoint_host):
+    if "container" in _nico_sim_backends(ctx):
+        _register_node_image(ctx, labels)
+    sim_dir = os.path.join(ctx.main_dir, "nico-sim")
+    return load_dynamic(os.path.join(sim_dir, "Tiltfile"))["register"](struct(
+        main_dir=ctx.main_dir,
+        cfg=ctx.cfg,
+        tilt_env=ctx.tilt_env,
+        kind_host_ip=endpoint_host,
+        provider_dir=sim_dir,
+        nico_org_id=nico.org_id,
+        nico_token=nico.token,
+    ))
+
+def register(ctx):
+    labels = ["2-nico"]
+    nico = _nico_config(ctx)
+    source_dir = _capnico_source_dir(ctx)
+    use_nico_sim = not nico.endpoint
+    nico_sim_endpoint_host = _nico_sim_endpoint_host(ctx)
+
+    sim_result = struct(controller_resource_deps=[], controller_env_overrides={})
+    endpoint = nico.endpoint
+    if use_nico_sim:
+        sim_result = _register_nico_sim(ctx, labels, nico, nico_sim_endpoint_host)
+        endpoint = "http://%s:18080" % nico_sim_endpoint_host
+
+    install_script = os.path.join(ctx.provider_dir, "install-capnico.sh")
+    install_cmd = [
+        "env",
+        "CAPNICO_NAMESPACE=" + CAPNICO_NAMESPACE,
+        "CAPNICO_RELEASE=" + CAPNICO_RELEASE,
+        "CAPNICO_IMAGE=" + CAPNICO_IMAGE,
+        "CAPNICO_STAGED_CHART_DIR=" + os.path.join(ctx.main_dir, ".local", "capnico-chart"),
+        "KIND_CLUSTER_NAME=" + _get_kind_cluster_name(),
+    ]
+    if source_dir:
+        install_cmd.append("CAPNICO_SOURCE_DIR=" + source_dir)
+    install_cmd += ["bash", install_script]
+
+    provider_deps = [install_script]
+    if source_dir:
+        provider_deps.append(source_dir)
+
+    local_resource(
+        CAPNICO_PROVIDER_RESOURCE,
+        labels=labels,
+        cmd=install_cmd,
+        resource_deps=["check-management-cluster"],
+        deps=provider_deps,
+        allow_parallel=True,
+    )
+
+    credential_deps = [CAPNICO_PROVIDER_RESOURCE]
+    if use_nico_sim:
+        credential_deps.append("nico-sim")
+
+    credentials_script = """
+          set -euo pipefail
+          endpoint="%s"
+
+          echo "Probing ${endpoint}/healthz from inside the cluster..."
+          kubectl -n %s delete pod capnico-endpoint-probe --ignore-not-found >/dev/null
+          kubectl -n %s run capnico-endpoint-probe \
+            --rm --attach --restart=Never --quiet \
+            --image=curlimages/curl:8.11.1 \
+            --command -- curl -fsS --max-time 10 "${endpoint}/healthz"
+
+          kubectl -n %s create secret generic nico-credentials \
+            --from-literal=endpoint="${endpoint}" \
+            --from-literal=orgID="%s" \
+            --from-literal=token="%s" \
+            --from-literal=apiName="%s" \
+            --dry-run=client -o yaml | kubectl apply -f -
+    """ % (
+        endpoint,
+        CAPNICO_NAMESPACE,
+        CAPNICO_NAMESPACE,
+        CAPNICO_NAMESPACE,
+        nico.org_id,
+        nico.token,
+        nico.api_name,
+    )
+    local_resource(
+        CAPNICO_CREDENTIALS_RESOURCE,
+        labels=labels,
+        cmd=["bash", "-c", credentials_script],
+        resource_deps=credential_deps,
+        allow_parallel=True,
+    )
+
+    controller_resource_deps = sim_result.controller_resource_deps + [CAPNICO_CREDENTIALS_RESOURCE]
+    controller_env_overrides = {}
+    controller_env_overrides.update(sim_result.controller_env_overrides)
+
+    controller_http_port = os.getenv("NVKE_CONTROLLER_HTTP_PORT", "") or "8080"
+    cmd_button(
+        "5-create-sample-local-nico-cluster",
+        argv=["bash", "-c", """
+          set -euo pipefail
+          NVKE_CONTROLLER_HTTP_PORT="%s" \
+          CLUSTER_NAME="${CLUSTER_NAME:-nico-local}" \
+          KUBERNETES_VERSION="${KUBERNETES_VERSION:-1.36.3}" \
+          CONTROL_PLANE_DESIRED_COUNT="${CONTROL_PLANE_DESIRED_COUNT:-1}" \
+          WORKER_DESIRED_COUNT="${WORKER_DESIRED_COUNT:-0}" \
+          ./hack/create-local-nico-cluster.sh
+        """ % controller_http_port],
+        resource="nvke-controller",
+        icon_name="add_box",
+        text="Create sample local NICo cluster",
+        inputs=[
+            text_input("CLUSTER_NAME", label="Cluster name", default="nico-local"),
+            text_input("KUBERNETES_VERSION", label="Kubernetes version", default="1.36.3"),
+            text_input("CONTROL_PLANE_DESIRED_COUNT", label="Control-plane nodes", default="1"),
+            text_input("WORKER_DESIRED_COUNT", label="Worker nodes", default="0"),
+        ],
+    )
+
+    preflight_script = """
+      command -v helm >/dev/null || { echo "helm is required for the nico provider" >&2; exit 1; }
+      command -v docker >/dev/null || { echo "docker is required for the nico provider" >&2; exit 1; }
+    """
+    if source_dir:
+        preflight_script += """      if [ ! -f "%s/chart/Chart.yaml" ]; then
+        echo "CAPNICo source directory '%s' is incomplete." >&2
+        exit 1
+      fi
+    """ % (source_dir, source_dir)
+    else:
+        preflight_script += """      if [ -z "${NGC_API_KEY:-}" ]; then
+        echo "NGC_API_KEY is required to install the released CAPNICo chart." >&2
+        exit 1
+      fi
+    """
+
+    return struct(
+        controller_resource_deps=controller_resource_deps,
+        controller_env_overrides=controller_env_overrides,
+        preflight_script=preflight_script,
+    )

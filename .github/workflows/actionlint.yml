@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Lints the workflow files themselves.
+#
+# A workflow that fails to parse, or that references a job output or secret that
+# does not exist, produces a run with no jobs and no useful error. Nothing here
+# checked for that. `cluster-api-provider-launchlayer` has run actionlint inside
+# its merge gate for a while; this is the same check inside NVKE's merge gate.
+#
+# Runs on ubuntu-latest. actionlint is a static binary that reads YAML — it needs
+# no Docker, no private dependency and no NVIDIA runner, so it should not consume
+# self-hosted capacity, and a contributor working from a fork can see it.
+#
+# Deliberately NOT path-filtered, unlike most workflows here. A filtered check
+# does not report on a pull request that misses the filter, and a required check
+# that never reports leaves that pull request waiting forever -- so filtering
+# would make this unrequirable. See .github/workflows/README.md. That is
+# not theoretical: a red run merged to main once and, because every branch
+# inherits the workflow file, the failure then reported on every open pull
+# request as though that pull request had caused it.
+#
+# The filter was saving nothing worth having. This is an eight-second static
+# binary on a GitHub-hosted runner, so running it on pushes that touch no
+# workflow file costs no self-hosted capacity and no meaningful time.
+
+name: Actionlint
+
+# All pull requests, including forks and Dependabot, reach this through
+# merge-gate.yml. The standalone push trigger is post-merge coverage on main;
+# naming mirror or Dependabot branches here too would run it a second time.
+on:
+  push:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started. Five merges in
+  # three minutes cancelled 18 runs across 7 workflows this way, leaving
+  # three consecutive commits on main with no test result at all.
+  #
+  # Pull-request branches keep sharing a group and still cancel, which is
+  # what you want there.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so every workflow merge-gate.yml calls would
+  # compute the same group and cancel each other -- 8 of 9 calls died that way,
+  # reported to the gate as failures with no jobs and no error message.
+  group: Actionlint-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A prebuilt binary rather than `go run`, which would compile actionlint
+      # from source on every run. The checksum is verified against the release
+      # the version pins, so a compromised download fails closed.
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          # One definition, in make/versions.mk, so `make show-versions` and this
+          # download cannot disagree.
+          ACTIONLINT_VERSION="$(make --no-print-directory print-ACTIONLINT_VERSION)"
+          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          tar="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          tmp="$(mktemp -d)"
+
+          # Retry: a CDN 504 must not fail the job on the first response.
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 240 \
+            -o "${tmp}/${tar}" "${base}/${tar}"
+          # A committed digest, not the release's checksums.txt: that file comes
+          # from the host that serves the artifact, so it proves transport, not
+          # provenance. make/tool-versions.mk carries it beside the version.
+          expected="$(make --no-print-directory print-ACTIONLINT_SHA256_AMD64)"
+
+          if [ -z "${expected}" ]; then
+            echo "::error::no checksum entry for ${tar}"
+            exit 1
+          fi
+          actual="$(sha256sum "${tmp}/${tar}" | awk '{print $1}')"
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error::checksum mismatch for ${tar}"
+            exit 1
+          fi
+
+          tar -xzf "${tmp}/${tar}" -C "${tmp}" actionlint
+          mkdir -p "${HOME}/.local/bin"
+          install -m 0755 "${tmp}/actionlint" "${HOME}/.local/bin/actionlint"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Lint the workflows
+        run: make lint-workflows

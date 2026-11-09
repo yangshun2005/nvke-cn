@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+hooks:
+  beforeJoinNode:
+    - runbook:
+        name: disable-ipv6-grub
+    - runbook:
+        name: disable-ipv6-sysctl
+    - runbook:
+        name: configure-inotify
+    - runbook:
+        name: enable-ipv4-forward
+    - runbook:
+        name: disable-swap
+    - runbook:
+        name: install-chrony
+    - runbook:
+        name: lvextend
+
+# Kept on the worker so the pre-join reboot path still runs in a lane, one node.
+# The control planes skip it: see nico-vms-cp.yaml.
+preJoinNodeReboot: true

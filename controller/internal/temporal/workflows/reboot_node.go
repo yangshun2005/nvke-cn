@@ -1,0 +1,504 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package workflows
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"strconv"
+	"time"
+
+	"github.com/google/uuid"
+	"go.temporal.io/api/enums/v1"
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
+
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/dsx-ai-factory/nvke/controller/internal/constants"
+	"github.com/dsx-ai-factory/nvke/controller/internal/db"
+	"github.com/dsx-ai-factory/nvke/controller/internal/keys"
+	"github.com/dsx-ai-factory/nvke/controller/internal/metrics"
+	"github.com/dsx-ai-factory/nvke/controller/internal/temporal/activities"
+)
+
+const (
+	RebootNodeWorkflowType = "RebootNode"
+)
+
+type RebootNodeInput struct {
+	NodeID           uuid.UUID
+	Reason           string
+	InitialTimeout   time.Duration
+	TimeoutIncrement time.Duration
+	MaxTimeout       time.Duration
+	PollingInterval  time.Duration
+
+	// SoftRebootEnabled selects between the in-guest soft reboot RPC (falling back to hard on
+	// RPC error or boot verification timeout) and the hard CAPI Machine reboot annotation, for any
+	// backend where the in-guest reboot path can never produce a real, detectable boot change.
+	SoftRebootEnabled bool
+}
+
+func RebootNode(ctx workflow.Context, input RebootNodeInput) (wfErr error) {
+	// Developer note:
+	// This workflow is depended upon by NVSentinel and dgxc-janitor.
+	// Please discuss any label or workflow changes with the #dgxc-gpu-node-resilience channel.
+	//
+	// Label-driven reboots try SoftRebootNode in-guest first, falling back to the CAPI Machine
+	// reboot annotation (an out-of-band CAPNICo power cycle) on failure. SoftRebootEnabled=false
+	// skips straight to the hard annotation.
+
+	logger := workflow.GetLogger(ctx)
+	logger.Info("Starting reboot node workflow", "nodeID", input.NodeID)
+
+	workflowStartTime := workflow.Now(ctx).UTC()
+
+	var node corev1.Node
+
+	defer func() {
+		// Clean up if the workflow is canceled
+		if node.Name != "" {
+			metrics.ClearCurrentAttempt(node.Name)
+		}
+		// Note we are using a named return here, which I generally dislike, but since this workflow
+		// will cancel itself if the user removes the reboot label, this defer statement will run
+		// before the cancel is processed by temporal, so this is the only way to observe the cancel in that case.
+		if errors.Is(ctx.Err(), workflow.ErrCanceled) || errors.Is(wfErr, workflow.ErrCanceled) {
+			logger.Info("Workflow canceled, cleaning up", "nodeID", input.NodeID, "nodeName", node.Name)
+			newCtx, _ := workflow.NewDisconnectedContext(ctx)
+			err := completeReboot(newCtx, input, constants.RebootStatusCanceled, nil)
+			if err != nil {
+				logger.Error("failed to clean up canceled workflow", "error", err, "nodeID", input.NodeID, "nodeName", node.Name)
+			}
+		}
+	}()
+
+	if input.NodeID == uuid.Nil {
+		return errors.New("nodeID is required")
+	}
+
+	// Check if node is a CP node
+	isCPNode, err := isControlPlaneNode(ctx, input.NodeID)
+	if err != nil {
+		return fmt.Errorf("failed to check if node is a control-plane node: %w", err)
+	}
+
+	// if CP node, remove reboot label and finish workflow with success
+	if isCPNode {
+		logger.Warn("Skipping reboot: Node is a control-plane node. label based reboots are not allowed for control-plane nodes", "nodeID", input.NodeID)
+		return completeReboot(ctx, input, constants.RebootStatusNotAllowed, nil)
+	}
+
+	// Set reboot-started label
+	// The reboot-started is an ephemeral label, and will be deleted after the node has rebooted.
+	rebootStartedLabel := keys.RebootStarted.Selector(formatTimeForK8sLabel(workflow.Now(ctx).UTC()))
+
+	// Also set reboot-status labels
+	// They are used to provide external visibility to SREs and engineers that the reboot is in progress,
+	// and making progress (or at least retrying) on the reboot, using kube native labels.
+	// Instead of needing access to our logging and monitoring.
+	rebootStatusLabel := keys.RebootStatus.Selector(string(constants.RebootStatusInProgress))
+	rebootStatusTime := keys.RebootStatusTimestamp.Selector(formatTimeForK8sLabel(time.Now().UTC()))
+
+	if err := applyRebootLabelsAndSetNodeCondition(ctx, input, rebootStartedLabel, rebootStatusLabel, rebootStatusTime); err != nil {
+		return fmt.Errorf("failed to apply reboot-started label to node: %w", err)
+	}
+
+	// Try to reboot the node forever, until it succeeds.
+	for rebootAttempt := 1; ; rebootAttempt++ {
+		// Get the current node json info
+		node, err = getNode(ctx, input.NodeID)
+		if err != nil {
+			return fmt.Errorf("failed to get node: %w", err)
+		}
+
+		if !rebootRequestActive(node) {
+			logger.Info("Node reboot request withdrawn or node terminating, canceling workflow", "nodeID", input.NodeID, "nodeName", node.Name)
+			return workflow.ErrCanceled
+		}
+
+		if !workflow.IsReplaying(ctx) {
+			metrics.SetCurrentAttempt(node.Name, rebootAttempt)
+		}
+
+		// Update reboot attempt label
+		rebootAttemptLabel := keys.RebootAttempt.Selector(strconv.Itoa(rebootAttempt))
+		if err := applyRebootLabelsAndSetNodeCondition(ctx, input, rebootAttemptLabel); err != nil {
+			return fmt.Errorf("failed to apply reboot-attempt label to node: %w", err)
+		}
+
+		// Reboot the node/instance via CAPI
+		logger.Info("Rebooting node", "nodeID", input.NodeID, "nodeName", node.Name, "rebootAttempt", rebootAttempt, "reason", input.Reason)
+		// Once the soft attempt fails, subsequent attempts stay on the hard path.
+		attemptInput := input
+		attemptInput.SoftRebootEnabled = input.SoftRebootEnabled && rebootAttempt == 1
+		err = rebootAndWaitCAPINode(ctx, attemptInput, rebootAttempt, node.Status.NodeInfo.BootID)
+		if err != nil {
+			// If the workflow was canceled, return the error to the caller
+			if errors.Is(ctx.Err(), workflow.ErrCanceled) || errors.Is(err, workflow.ErrCanceled) || temporal.IsCanceledError(err) {
+				return workflow.ErrCanceled
+			}
+			if !isRebootVerificationTimeout(err) {
+				return err
+			}
+			// Otherwise, log the error and continue to the next attempt
+			logger.Error("failed to wait for node reboot", "error", err, "nodeID", input.NodeID, "nodeName", node.Name, "rebootAttempt", rebootAttempt)
+			continue
+		}
+		logger.Info("Node booted successfully", "nodeID", input.NodeID, "nodeName", node.Name, "rebootAttempt", rebootAttempt)
+
+		return completeReboot(ctx, input, constants.RebootStatusCompleted, &rebootSuccessDetails{
+			node:              node,
+			workflowStartTime: workflowStartTime,
+			rebootAttempt:     rebootAttempt,
+		})
+	}
+}
+
+// rebootAndWaitCAPINode gives one soft attempt a bounded verification window, then
+// uses the existing CAPI hard-reboot path. Unknown scheduling outcomes receive the
+// same window as accepted requests, because the reboot may already be in progress.
+func rebootAndWaitCAPINode(ctx workflow.Context, input RebootNodeInput, rebootAttempt int, previousBootID string) error {
+	logger := workflow.GetLogger(ctx)
+	if input.SoftRebootEnabled {
+		message := fmt.Sprintf("Soft rebooting node (attempt: %d): %s", rebootAttempt, input.Reason)
+		if err := updateNodeRebootingCondition(ctx, input.NodeID, db.ConditionStatusTrue, message); err != nil {
+			return fmt.Errorf("failed to update node conditions: %w", err)
+		}
+		started := workflow.Now(ctx).UTC()
+		err := softRebootNode(ctx, input.NodeID, rebootAttempt, started, 1)
+		if err == nil {
+			softInput := input
+			if softInput.PollingInterval <= 0 || softInput.PollingInterval > 10*time.Second {
+				softInput.PollingInterval = 10 * time.Second
+			}
+			softTimeout := 30 * time.Minute
+			if input.InitialTimeout > 0 {
+				softTimeout = min(softTimeout, input.InitialTimeout)
+			}
+			err = waitForBootChange(ctx, softInput, previousBootID, started, softTimeout)
+			if err == nil {
+				return nil
+			}
+			if !isRebootVerificationTimeout(err) {
+				return err
+			}
+		}
+		if errors.Is(ctx.Err(), workflow.ErrCanceled) || temporal.IsCanceledError(err) {
+			return workflow.ErrCanceled
+		}
+
+		// Re-read before escalating so a late boot or withdrawn request cannot
+		// turn into a second disruptive action.
+		node, readErr := getNode(ctx, input.NodeID)
+		if readErr != nil {
+			return fmt.Errorf("failed to inspect node before hard reboot: %w", readErr)
+		}
+		if !rebootRequestActive(node) {
+			return workflow.ErrCanceled
+		}
+		if node.Status.NodeInfo.BootID != "" && node.Status.NodeInfo.BootID != previousBootID {
+			return nil
+		}
+		logger.Warn("Soft reboot did not complete, falling back to CAPI hard reboot", "nodeID", input.NodeID, "error", err)
+	}
+
+	input.SoftRebootEnabled = false
+	started, err := rebootCAPINode(ctx, input, rebootAttempt)
+	if err != nil {
+		return fmt.Errorf("failed to initiate hard reboot: %w", err)
+	}
+	return waitForNodeReboot(ctx, input, rebootAttempt, previousBootID, started)
+}
+
+func rebootRequestActive(node corev1.Node) bool {
+	_, terminating := keys.Terminate.Get(node.Labels)
+	return keys.Reboot.Value(node.Labels) != "" && node.DeletionTimestamp.IsZero() && !terminating
+}
+
+func isRebootVerificationTimeout(err error) bool {
+	var timeoutErr *temporal.TimeoutError
+	return errors.As(err, &timeoutErr) && timeoutErr.TimeoutType() == enums.TIMEOUT_TYPE_SCHEDULE_TO_CLOSE
+}
+
+type rebootSuccessDetails struct {
+	node              corev1.Node
+	workflowStartTime time.Time
+	rebootAttempt     int
+}
+
+// completeReboot applies terminal reboot labels and clears the rebooting DB condition.
+// Pass success non-nil only after a successful reboot: sets last-completed-reboot, records metrics, and logs completion.
+func completeReboot(ctx workflow.Context, input RebootNodeInput, status constants.RebootStatus, success *rebootSuccessDetails) error {
+	logger := workflow.GetLogger(ctx)
+
+	ts := formatTimeForK8sLabel(time.Now().UTC())
+
+	var conditionMsg string
+	if success != nil {
+		conditionMsg = "Node successfully rebooted at " + ts
+	} else {
+		conditionMsg = "Node reboot " + string(status) + " at " + ts
+	}
+
+	if err := deleteCAPIMachineRebootAnnotation(ctx, input.NodeID); err != nil {
+		return fmt.Errorf("failed to delete capi machine reboot annotation: %w", err)
+	}
+
+	rebootStatusLabel := keys.RebootStatus.Selector(string(status))
+	rebootStatusTime := keys.RebootStatusTimestamp.Selector(ts)
+
+	// Clear the request and the in-flight bookkeeping in both domains: the
+	// reboot request may have been applied by hand under either one, and a
+	// node labeled by an earlier build carries the legacy form.
+	deleteLabels := slices.Concat(
+		keys.RebootStarted.RemoveSelectors(),
+		keys.Reboot.RemoveSelectors(),
+		keys.RebootAttempt.RemoveSelectors(),
+	)
+
+	var labelArgs []string
+	labelArgs = append(labelArgs, rebootStatusLabel, rebootStatusTime)
+
+	if success != nil {
+		labelArgs = append(labelArgs, keys.LastCompletedReboot.Selector(ts))
+	}
+	labelArgs = append(labelArgs, deleteLabels...)
+
+	if err := applyRebootLabelsAndSetNodeCondition(ctx, input, labelArgs...); err != nil {
+		return fmt.Errorf("failed to apply completion labels to node: %w", err)
+	}
+
+	if err := updateNodeRebootingCondition(ctx, input.NodeID, db.ConditionStatusFalse, conditionMsg); err != nil {
+		return fmt.Errorf("failed to update node conditions: %w", err)
+	}
+
+	if success != nil {
+		duration := workflow.Now(ctx).Sub(success.workflowStartTime)
+		if !workflow.IsReplaying(ctx) {
+			rebootReason := keys.Reboot.Value(success.node.Labels)
+			metrics.RecordRebootCompleted(rebootReason, duration, success.rebootAttempt)
+		}
+		logger.Info("Node reboot complete", "nodeID", input.NodeID, "nodeName", success.node.Name, "rebootAttempt", success.rebootAttempt, "duration", duration.Seconds())
+	}
+
+	return nil
+}
+
+// ISO datetime strings cannot be used as-is for labels, as they contain colons.
+// A label format has already been described in mk8s Node Management Guidelines.
+func formatTimeForK8sLabel(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15-04-05Z")
+}
+
+func applyRebootLabelsAndSetNodeCondition(ctx workflow.Context, input RebootNodeInput, labels ...string) error {
+	var a *activities.Activities
+
+	activityOptions := workflow.ActivityOptions{
+		StartToCloseTimeout: 1 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval: 1 * time.Minute,
+			MaximumInterval: 5 * time.Minute,
+			MaximumAttempts: 0, // Retry indefinitely
+		},
+	}
+
+	if err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, activityOptions),
+		a.LabelNode,
+		activities.LabelNodeInput{
+			NodeID:                        input.NodeID,
+			Labels:                        labels,
+			NodeRebootingConditionMessage: "Labeling node",
+		},
+	).Get(ctx, nil); err != nil {
+		return fmt.Errorf("failed to apply label to node: %w", err)
+	}
+
+	return nil
+}
+
+func getNode(ctx workflow.Context, nodeID uuid.UUID) (corev1.Node, error) {
+	var a *activities.Activities
+
+	activityOptions := workflow.ActivityOptions{
+		StartToCloseTimeout: 1 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval: 1 * time.Minute,
+			MaximumInterval: 5 * time.Minute,
+			MaximumAttempts: 0, // Retry indefinitely
+		},
+	}
+
+	var result activities.GetKubeNodeResult
+	if err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, activityOptions),
+		a.GetKubeNode,
+		activities.GetKubeNodeInput{
+			NodeID:                        nodeID,
+			NodeRebootingConditionMessage: "Getting node info",
+		},
+	).Get(ctx, &result); err != nil {
+		return corev1.Node{}, fmt.Errorf("failed to get node bootID: %w", err)
+	}
+
+	return result.Node, nil
+}
+
+// rebootCAPINode tries the in-guest soft-reboot path first when input.SoftRebootEnabled, falling
+// back to the CAPI Machine reboot annotation (an out-of-band CAPNICo power cycle) on failure, or
+// going straight to it when soft reboot is disabled.
+func rebootCAPINode(ctx workflow.Context, input RebootNodeInput, rebootAttempt int) (time.Time, error) {
+	logger := workflow.GetLogger(ctx)
+	nodeID := input.NodeID
+	message := fmt.Sprintf("Rebooting node (attempt: %d): %s", rebootAttempt, input.Reason)
+
+	// Set the rebooting node condition in the controller db
+	if err := updateNodeRebootingCondition(ctx, nodeID, db.ConditionStatusTrue, message); err != nil {
+		return time.Time{}, fmt.Errorf("failed to update node conditions: %w", err)
+	}
+
+	if !input.SoftRebootEnabled {
+		return applyCAPIMachineRebootAnnotation(ctx, nodeID)
+	}
+
+	rebootStartedTime := workflow.Now(ctx).UTC()
+
+	err := softRebootNode(ctx, nodeID, rebootAttempt, rebootStartedTime, 1)
+	if err == nil {
+		logger.Info("Soft reboot initiated", "nodeID", nodeID, "rebootAttempt", rebootAttempt)
+		return rebootStartedTime, nil
+	}
+
+	if errors.Is(ctx.Err(), workflow.ErrCanceled) || temporal.IsCanceledError(err) {
+		logger.Info("Reboot workflow canceled", "nodeID", nodeID, "rebootAttempt", rebootAttempt)
+		return time.Time{}, err
+	}
+
+	logger.Warn("Soft reboot failed, falling back to CAPI hard reboot", "nodeID", nodeID, "rebootAttempt", rebootAttempt, "error", err)
+	return applyCAPIMachineRebootAnnotation(ctx, nodeID)
+}
+
+// waitForNodeReboot waits, with a linearly increasing timeout, for the reboot to take effect. A
+// timeout does not fall back to a hard reboot; it returns an error, and the caller's attempt loop
+// retries from the top.
+func waitForNodeReboot(ctx workflow.Context, input RebootNodeInput, rebootAttempt int, previousBootID string, rebootStartedTime time.Time) error {
+	// Linear timeout increase based on reboot attempt
+	// e.g. 30m, 45m, 60m, ...
+	timeout := min(input.InitialTimeout+(input.TimeoutIncrement*time.Duration(rebootAttempt-1)), input.MaxTimeout)
+
+	return waitForBootChange(ctx, input, previousBootID, rebootStartedTime, timeout)
+}
+
+// waitForBootChange waits, bounded by timeout, for a bootID change or the reboot-complete
+// annotation applied after annotationAfterTime.
+func waitForBootChange(ctx workflow.Context, input RebootNodeInput, previousBootID string, annotationAfterTime time.Time, timeout time.Duration) error {
+	var a *activities.Activities
+
+	activityOptions := workflow.ActivityOptions{
+		ScheduleToCloseTimeout: timeout,
+		HeartbeatTimeout:       2 * time.Minute,
+	}
+
+	if err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, activityOptions),
+		a.WaitForNodeReboot,
+		activities.WaitForNodeRebootInput{
+			NodeID:                        input.NodeID,
+			PreviousBootID:                previousBootID,
+			CheckRebootCompleteAnnotation: true,
+			AnnotationAfterTime:           annotationAfterTime,
+			PollingInterval:               input.PollingInterval,
+		},
+	).Get(ctx, nil); err != nil {
+		return fmt.Errorf("failed to wait for node reboot: %w", err)
+	}
+
+	return nil
+}
+
+func applyCAPIMachineRebootAnnotation(ctx workflow.Context, nodeID uuid.UUID) (time.Time, error) {
+	var a *activities.Activities
+
+	activityOptions := workflow.ActivityOptions{
+		StartToCloseTimeout: 1 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval: 1 * time.Minute,
+			MaximumInterval: 5 * time.Minute,
+			MaximumAttempts: 0, // Retry indefinitely
+		},
+	}
+
+	var result activities.ApplyCAPIMachineRebootAnnotationResult
+	if err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, activityOptions),
+		a.ApplyCAPIMachineRebootAnnotation,
+		activities.ApplyCAPIMachineRebootAnnotationInput{
+			NodeID: nodeID,
+		},
+	).Get(ctx, &result); err != nil {
+		return time.Time{}, fmt.Errorf("failed to apply capi machine reboot annotation: %w", err)
+	}
+
+	return result.RebootStartedTime, nil
+}
+
+func deleteCAPIMachineRebootAnnotation(ctx workflow.Context, nodeID uuid.UUID) error {
+	var a *activities.Activities
+
+	activityOptions := workflow.ActivityOptions{
+		StartToCloseTimeout: 1 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval: 1 * time.Minute,
+			MaximumInterval: 5 * time.Minute,
+			MaximumAttempts: 0, // Retry indefinitely
+		},
+	}
+
+	if err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, activityOptions),
+		a.DeleteCAPIMachineRebootAnnotation,
+		activities.DeleteCAPIMachineRebootAnnotationInput{
+			NodeID: nodeID,
+		},
+	).Get(ctx, nil); err != nil {
+		return fmt.Errorf("failed to delete capi machine reboot annotation: %w", err)
+	}
+
+	return nil
+}
+
+func updateNodeRebootingCondition(ctx workflow.Context, nodeID uuid.UUID, status db.ConditionStatus, message string) error {
+	var a *activities.Activities
+
+	return workflow.ExecuteActivity(withDBOptions(ctx), a.UpdateNodeConditions, activities.NodeConditionsUpdate{
+		NodeID: nodeID,
+		Conditions: activities.NodeConditions{
+			Rebooting: &activities.ConditionUpdate{
+				Status:  status,
+				Message: message,
+			},
+		},
+	}).Get(ctx, nil)
+}
+
+func isControlPlaneNode(ctx workflow.Context, nodeID uuid.UUID) (bool, error) {
+	logger := workflow.GetLogger(ctx)
+	var a *activities.Activities
+
+	// Get nodePool Info using nodeID
+	nodePool := db.NodePool{}
+	if err := workflow.ExecuteActivity(withDBOptions(ctx), a.GetNodePoolForNode, nodeID).Get(ctx, &nodePool); err != nil {
+		return false, fmt.Errorf("failed to get nodepool info for node: %w", err)
+	}
+
+	// check if node belongs to controlplane nodepool
+	if nodePool.ControlPlane {
+		logger.Debug("Node belongs to control-plane nodepool", "nodeID", nodeID, "nodePoolName", nodePool.Name)
+		return true, nil
+	}
+	return false, nil
+}

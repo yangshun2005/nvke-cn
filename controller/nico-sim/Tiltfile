@@ -1,0 +1,569 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("ext://helm_resource", "helm_repo", "helm_resource")
+load("ext://uibutton", "bool_input", "cmd_button", "choice_input", "text_input")
+
+# Pin chart versions to avoid surprise breakage from upstream releases.
+CHART_VERSION_LOKI = "6.29.0"
+CHART_VERSION_PROMTAIL = "6.16.6"
+CHART_VERSION_GRAFANA = "8.12.1"
+OBSERVABILITY_NAMESPACE = "observability"
+NICO_SIM_PORT = "18080"
+
+# Tilt UI link offset for remote targets accessed via forwarded ports (e.g.
+# Mutagen +1000). Set TILT_LINK_PORT_OFFSET; default 0 = local. Offsets only the
+# displayed link URLs, not the service bind ports.
+_LINK_PORT_OFFSET = int(os.getenv("TILT_LINK_PORT_OFFSET", "0"))
+
+def _ui_link(port, path, name):
+    return link("http://localhost:%d%s" % (port + _LINK_PORT_OFFSET, path), name)
+
+# ---------------------------------------------------------------------------
+# Network helpers — derive the gateway and DHCP pool from the bridge CIDR.
+# ---------------------------------------------------------------------------
+
+def _pow2(n):
+    """Integer power-of-2 (Starlark has no << operator)."""
+    r = 1
+    for _ in range(n):
+        r *= 2
+    return r
+
+def _ip_to_int(ip):
+    o = [int(x) for x in ip.split(".")]
+    return o[0] * 16777216 + o[1] * 65536 + o[2] * 256 + o[3]
+
+def _int_to_ip(n):
+    return "%d.%d.%d.%d" % (
+        n // 16777216,
+        (n // 65536) % 256,
+        (n // 256) % 256,
+        n % 256,
+    )
+
+def _parse_bridge_ranges(bridge_cidr):
+    """Derive the gateway and DHCP pool from the bridge subnet.
+
+    Returns a struct with gateway, dhcp_start, dhcp_end. The control-plane VIP
+    range is a separate OFF-LINK subnet (see _vip_cidr in register()), not
+    carved from the bridge, so the entire bridge (from .10 to the last usable
+    host) is available for DHCP.
+    """
+    parts = bridge_cidr.split("/")
+    base_ip = parts[0]
+    prefix_len = int(parts[1])
+
+    base_int = _ip_to_int(base_ip)
+    host_count = _pow2(32 - prefix_len)
+    # Mask to network address (clear host bits).
+    network_int = base_int - (base_int % host_count)
+
+    return struct(
+        gateway    = _int_to_ip(network_int + 1),
+        dhcp_start = _int_to_ip(network_int + 10),
+        # network_int + host_count - 1 is the broadcast address; -2 is the last usable host.
+        dhcp_end   = _int_to_ip(network_int + host_count - 2),
+    )
+
+def _nico_sim_backends(cfg):
+    raw = cfg.get("nico_sim_backends", ["container"])
+
+    if type(raw) == "string":
+        raw = [raw]
+    if type(raw) != "list":
+        fail("tilt_config.json field 'nico_sim_backends' must be a string or list")
+
+    backends = []
+    for backend in raw:
+        normalized = str(backend)
+        if normalized != "container" and normalized != "vm":
+            fail("tilt_config.json field 'nico_sim_backends' supports only 'container' and 'vm' (got %s)" % backend)
+        if normalized not in backends:
+            backends.append(normalized)
+
+    if len(backends) == 0:
+        fail("tilt_config.json field 'nico_sim_backends' must include at least one backend")
+
+    return backends
+
+def register(ctx):
+    """Register nico-sim component resources.
+
+    Args:
+        ctx: struct with main_dir, cfg, kind_host_ip, provider_dir.
+
+    Returns:
+        struct with controller_resource_deps and controller_env_overrides.
+    """
+    provider_dir = ctx.provider_dir
+    _deploy = os.path.join(provider_dir, "deploy")
+    _dev = os.path.join(provider_dir, ".dev")
+    _log_dir = os.path.join(_dev, "logs")
+    _host_os = str(local("uname -s", quiet=True, echo_off=True)).strip()
+    _backends = _nico_sim_backends(ctx.cfg)
+    _container_backend_enabled = "container" in _backends
+    _vm_backend_enabled = "vm" in _backends
+    # NFS-backed worktrees cannot store Linux file capabilities. Build the
+    # runnable server outside the worktree so build-privileged can apply
+    # CAP_NET_ADMIN consistently; source and persistent state stay in the
+    # worktree.
+    #
+    # Not /tmp when /tmp is nosuid. Ubuntu 26.04 mounts it as a nosuid tmpfs,
+    # and nosuid makes the kernel drop file capabilities at exec: setcap
+    # succeeds, getcap shows the bit, and the process still starts with
+    # CapEff=0. The BGP speaker then fails every route install with "operation
+    # not permitted" and the control-plane VIP never becomes reachable.
+    _nico_sim_binary = "/tmp/cwe-nico-sim"
+    _tmp_opts = str(local("findmnt -no OPTIONS --target /tmp 2>/dev/null || true", quiet=True, echo_off=True))
+    if "nosuid" in _tmp_opts:
+        _nico_sim_binary = os.path.join(os.getenv("HOME", "/var/tmp"), ".cache", "cwe-nico-sim")
+    _build_target = "build"
+    if _vm_backend_enabled and _host_os == "Linux":
+        _build_target = "build-privileged"
+    _nico_sim_make_cmd = "make BINARY=%s %s" % (_nico_sim_binary, _build_target)
+    if _host_os == "Darwin" and not os.getenv("CC", ""):
+        _homebrew_clang = "/opt/homebrew/opt/llvm/bin/clang"
+        if str(local("test -x %s && echo available || true" % _homebrew_clang, quiet=True, echo_off=True)).strip() == "available":
+            _nico_sim_make_cmd = "CC=%s %s" % (_homebrew_clang, _nico_sim_make_cmd)
+    _nico_sim_build_cmd = "truncate -s 0 %s/nico-sim.log 2>/dev/null; mkdir -p %s; cd nico-sim && %s" % (_log_dir, os.path.dirname(_nico_sim_binary), _nico_sim_make_cmd)
+    if os.getenv("NICO_SIM_BINARY_PREBUILT", "false") == "true":
+        _nico_sim_build_cmd = "test -x %s" % _nico_sim_binary
+
+    # -----------------------------------------------------------------------
+    # Network layout — partition bridge subnet into DHCP and VIP pools.
+    # -----------------------------------------------------------------------
+    # None of this applies to darwin-qemu: its VMs join Apple's vmnet shared
+    # network, whose subnet nico-sim discovers and Apple's DHCP serves. Its VIPs
+    # still come from the VIP range below, routed by nico-sim's BGP speaker via
+    # sudo route (the VIP range defaults to the same 172.31.0.0/24 in nico-sim).
+    _bridge_layout = _vm_backend_enabled and _host_os == "Linux"
+    _bridge_cidr = os.getenv("NICO_VMS_BRIDGE_CIDR", "172.30.0.0/24")
+    _ranges = _parse_bridge_ranges(_bridge_cidr)
+    # The VIP range is intentionally OFF-LINK (a separate subnet from the bridge)
+    # so the VIP is reached via L3 routing through the gateway + the BGP-installed
+    # route -- the same path production uses -- instead of on-link ARP. An on-link
+    # VIP (carved from the bridge subnet) makes nodes ARP for it, which bypasses
+    # BGP entirely, so the harness can't exercise kube-vip's health-check route
+    # withdrawal (and produces spurious stale-ARP artifacts during CP drain).
+    # Keep it off the kind Docker subnet (172.18.0.0/16) too.
+    _vip_cidr = os.getenv("NICO_VMS_VIP_CIDR", "172.31.0.0/24")
+    if _bridge_layout:
+        print("nico-vms network layout (bridge %s):" % _bridge_cidr)
+        print("  gateway:    %s" % _ranges.gateway)
+        print("  DHCP pool:  %s - %s" % (_ranges.dhcp_start, _ranges.dhcp_end))
+        print("  VIP range (off-link, routed via BGP):   %s" % _vip_cidr)
+
+    # -----------------------------------------------------------------------
+    # Preflight: ensure inotify limit is high enough for Promtail.
+    # -----------------------------------------------------------------------
+    if _vm_backend_enabled and _host_os == "Linux":
+        local("bash -c '" +
+        'inotify_instances="$(cat /proc/sys/fs/inotify/max_user_instances)"; ' +
+        'if [ "${inotify_instances}" -lt 512 ]; then ' +
+        '  echo "Raising fs.inotify.max_user_instances from ${inotify_instances} to 1024 (needed by Promtail)..."; ' +
+        "  sudo sysctl -w fs.inotify.max_user_instances=1024 >/dev/null; " +
+        "fi'")
+
+    # Ensure .dev directories and seed files exist.
+    local("mkdir -p %s/logs %s/instances && touch %s/nico-vms-targets.json" % (_dev, _dev, _dev))
+
+    # -----------------------------------------------------------------------
+    # Observability stack (Loki + Promtail DaemonSet + Grafana in K8s)
+    #
+    # On by default for a developer. A CI lane turns it off with
+    # "nico_vms_observability": false in tilt_config.json: three Helm installs
+    # and a host Promtail container that nothing in the lane reads, and one more
+    # chart repository and image registry that can be down.
+    # -----------------------------------------------------------------------
+    _observability = _vm_backend_enabled and ctx.cfg.get("nico_vms_observability", True)
+    _helm_values = os.path.join(_deploy, "helm-values")
+
+    if _observability:
+        helm_repo(
+            "grafana",
+            "https://grafana.github.io/helm-charts",
+            labels=["4-observability"],
+            resource_name="grafana-repo",
+        )
+
+        _loki_values = os.path.join(_helm_values, "loki.yaml")
+        helm_resource(
+            "loki",
+            "grafana/loki",
+            labels=["4-observability"],
+            release_name="loki",
+            namespace=OBSERVABILITY_NAMESPACE,
+            deps=[_loki_values],
+            flags=[
+              "--create-namespace",
+              "--values", _loki_values,
+              "--version", CHART_VERSION_LOKI,
+              "--wait",
+              "--timeout", "10m",
+            ],
+            resource_deps=["check-management-cluster", "grafana-repo"],
+        )
+
+        _promtail_values = os.path.join(_helm_values, "promtail.yaml")
+        helm_resource(
+            "promtail",
+            "grafana/promtail",
+            labels=["4-observability"],
+            release_name="promtail",
+            namespace=OBSERVABILITY_NAMESPACE,
+            deps=[_promtail_values],
+            flags=[
+              "--create-namespace",
+              "--values", _promtail_values,
+              "--version", CHART_VERSION_PROMTAIL,
+              "--wait",
+              "--timeout", "10m",
+            ],
+            resource_deps=["loki"],
+        )
+
+        _grafana_values = os.path.join(_helm_values, "grafana.yaml")
+        helm_resource(
+            "grafana",
+            "grafana/grafana",
+            labels=["4-observability"],
+            release_name="grafana",
+            namespace=OBSERVABILITY_NAMESPACE,
+            deps=[_grafana_values],
+            flags=[
+              "--create-namespace",
+              "--values", _grafana_values,
+              "--version", CHART_VERSION_GRAFANA,
+              "--wait",
+              "--timeout", "10m",
+            ],
+            resource_deps=["loki"],
+        )
+
+        local_resource(
+            "port-forward-grafana",
+            labels=["4-observability"],
+            serve_cmd="while true; do kubectl -n %s port-forward svc/grafana 3000:80 || true; sleep 2; done" % OBSERVABILITY_NAMESPACE,
+            resource_deps=["grafana"],
+            readiness_probe=probe(exec=exec_action(["nc", "-z", "localhost", "3000"]), period_secs=5, failure_threshold=2),
+            allow_parallel=True,
+            links=[_ui_link(3000, "", "Grafana")],
+        )
+
+        local_resource(
+            "port-forward-loki",
+            labels=["4-observability"],
+            serve_cmd="while true; do kubectl -n %s port-forward svc/loki 3100:3100 || true; sleep 2; done" % OBSERVABILITY_NAMESPACE,
+            resource_deps=["loki"],
+            readiness_probe=probe(exec=exec_action(["nc", "-z", "localhost", "3100"]), period_secs=5, failure_threshold=2),
+            allow_parallel=True,
+        )
+
+    # -----------------------------------------------------------------------
+    # nico-sim local resources
+    # -----------------------------------------------------------------------
+    def serve_with_log(working_dir, binary, service_name):
+        return "bash -c 'cd %s && exec %s > >(tee %s/%s.log) 2>&1'" % (
+            working_dir, binary, _log_dir, service_name)
+
+    # dnsmasq: DHCP/DNS for VMs on the local bridge (skip if not installed).
+    _dnsmasq_available = False
+    if _bridge_layout:
+        _dnsmasq_available = str(local("command -v dnsmasq >/dev/null 2>&1 && echo yes || echo no", quiet=True)).strip() == "yes"
+    _nico_sim_deps = ["check-management-cluster"]
+
+    if _container_backend_enabled and "nico" in ctx.cfg.get("providers", []):
+        _nico_sim_deps.append("nico-kind-node-image")
+
+    if _bridge_layout and _dnsmasq_available:
+        local_resource(
+            "nico-vms-dnsmasq",
+            serve_cmd=serve_with_log("nico-sim", "./scripts/run-dnsmasq.sh", "nico-vms-dnsmasq"),
+            serve_env={"NICO_VMS_BRIDGE_CIDR": _bridge_cidr, "NICO_VMS_DHCP_RANGE_END": _ranges.dhcp_end},
+            deps=[os.path.join(provider_dir, "scripts", "run-dnsmasq.sh")],
+            labels=["5-nico-sim"],
+        )
+        _nico_sim_deps.append("nico-vms-dnsmasq")
+    elif _bridge_layout:
+        warn("dnsmasq not found -- VMs using DHCP will not get IPs. Install dnsmasq.")
+
+    _files_dir = os.getenv("NICO_SIM_FILES_DIR", "") or ctx.tilt_env.get("NICO_SIM_FILES_DIR", "") or os.path.join(_dev, "files")
+    if not _files_dir.startswith("/"):
+        _files_dir = os.path.abspath(os.path.join(provider_dir, _files_dir))
+    _default_os_image_destination = "images/nvke-node.qcow2"
+    _os_image_destination = os.getenv("NICO_VMS_OS_IMAGE_DESTINATION", "") or ctx.tilt_env.get("NICO_VMS_OS_IMAGE_DESTINATION", "") or _default_os_image_destination
+    _nvkr_bin = os.getenv("NVKR_BIN", "") or ctx.tilt_env.get("NVKR_BIN", "")
+    if not _nvkr_bin:
+        _nvkr_bin = str(local("command -v nvkr 2>/dev/null || true", quiet=True)).strip()
+    _nvkr_release_reference = os.getenv("NVKR_RELEASE_REFERENCE", "") or ctx.tilt_env.get("NVKR_RELEASE_REFERENCE", "")
+    _nvkr_release_output = os.getenv("NVKR_RELEASE_OUTPUT", "") or ctx.tilt_env.get("NVKR_RELEASE_OUTPUT", "")
+    if not _nvkr_release_output:
+        _host_arch = str(local("uname -m", quiet=True)).strip()
+        if _host_arch == "x86_64" or _host_arch == "amd64":
+            _nvkr_release_output = "nvke-node-fde-amd64"
+        elif _host_arch == "aarch64" or _host_arch == "arm64":
+            _nvkr_release_output = "nvke-node-fde-arm64"
+        else:
+            fail("unsupported host architecture for the default NVKR release output: %s" % _host_arch)
+    _default_pull_nvkr_release = bool(_nvkr_release_reference)
+    _default_pull_nvkr_release_env = "true" if _default_pull_nvkr_release else "false"
+
+    nico_sim_env = {
+        "NICO_SIM_LISTEN_ADDR": ":18080",
+        "NICO_SIM_FILES_DIR": _files_dir,
+        "NICO_SIM_DB_PATH": os.path.join(_dev, "nico-sim.db"),
+        "NICO_VMS_BASE_IMAGE": os.path.join(provider_dir, "images", "ubuntu-cloud.qcow2"),
+        "NICO_VMS_VM_DISK_GIB": "40",
+        "NICO_CONTAINERS_ENABLED": "false",
+    }
+    if _host_os == "Linux":
+        nico_sim_env["NICO_VMS_BRIDGE_CIDR"] = _bridge_cidr
+        nico_sim_env["NICO_VMS_BGP_VIP_CIDRS"] = _vip_cidr
+    if _container_backend_enabled:
+        nico_sim_env["NICO_CONTAINERS_ENABLED"] = "true"
+    if not _vm_backend_enabled:
+        nico_sim_env.update({
+            "NICO_VMS_VM_BACKEND": "mock",
+            "NICO_VMS_BGP_ENABLED": "false",
+        })
+    else:
+        nico_sim_env.update({
+            "NICO_VMS_PROMTAIL_TARGETS_FILE": os.path.join(_dev, "nico-vms-targets.json"),
+            "NICO_VMS_PROMTAIL_LOG_PATH_PREFIX": "/var/log/vm-instances",
+        })
+    if _container_backend_enabled and "nico" in ctx.cfg.get("providers", []):
+        nico_sim_env.update({
+            "NICO_CONTAINERS_REQUIRE_HEALTHY": "true",
+            "NICO_CONTAINERS_NODE_IMAGE": os.getenv("CAPD_KINDEST_NODE_IMAGE", "cwe-capd-kindest-node:local"),
+            "NICO_CONTAINERS_SPIRE_ATTESTATION_METHOD": ctx.cfg.get(
+                "controller_attestation_method",
+                "dsxImds" if "dsx-imds-attestation" in ctx.cfg.get("providers", []) else "tpm",
+            ),
+        })
+    _image_cache = ctx.cfg.get("nico_sim_image_cache_dir", "")
+    _image_cache_dir = _image_cache or os.path.join(os.getenv("HOME", "/tmp"), ".cache", "nico-sim", "images")
+    if not _image_cache_dir.startswith("/"):
+        _image_cache_dir = os.path.abspath(os.path.join(ctx.main_dir, _image_cache_dir))
+    nico_sim_env["NICO_VMS_IMAGE_CACHE_DIR"] = _image_cache_dir
+
+    local_resource(
+        "nico-sim",
+        cmd=_nico_sim_build_cmd,
+        serve_cmd=serve_with_log("nico-sim", _nico_sim_binary, "nico-sim"),
+        serve_env=nico_sim_env,
+        deps=[os.path.join(provider_dir, "cmd"), os.path.join(provider_dir, "internal")],
+        resource_deps=_nico_sim_deps,
+        readiness_probe=probe(tcp_socket=tcp_socket_action(port=18080)),
+        links=[_ui_link(18080, "/ui/", "nico-sim UI")],
+        labels=["5-nico-sim"],
+    )
+
+    if _vm_backend_enabled:
+        cmd_button(
+            "0-stage-os-image",
+            argv=["bash", "-c", """
+              set -euo pipefail
+              cd %s
+              NVKR_BIN="%s" \
+              NVKR_RELEASE_REFERENCE="${NVKR_RELEASE_REFERENCE:-%s}" \
+              NVKR_RELEASE_OUTPUT="${NVKR_RELEASE_OUTPUT:-%s}" \
+              NICO_SIM_FILES_DIR="%s" \
+              NICO_VMS_IMAGE_CACHE_DIR="%s" \
+              NICO_VMS_PULL_NVKR_RELEASE="${NICO_VMS_PULL_NVKR_RELEASE:-%s}" \
+              NICO_VMS_OS_IMAGE_URL="${NICO_VMS_OS_IMAGE_URL:-}" \
+              NICO_VMS_OS_IMAGE_DESTINATION="${NICO_VMS_OS_IMAGE_DESTINATION:-%s}" \
+              ./hack/stage-nico-vms-image.sh
+            """ % (ctx.main_dir, _nvkr_bin, _nvkr_release_reference, _nvkr_release_output, _files_dir, _image_cache_dir, _default_pull_nvkr_release_env, _os_image_destination)],
+            resource="nico-sim",
+            icon_name="download",
+            text="Stage OS image",
+            inputs=[
+                bool_input(
+                    "NICO_VMS_PULL_NVKR_RELEASE",
+                    label="Pull NVKR release",
+                    default=_default_pull_nvkr_release,
+                    true_string="true",
+                    false_string="false",
+                ),
+                text_input("NVKR_RELEASE_REFERENCE", label="NVKR release reference", default=_nvkr_release_reference, placeholder="registry/repository@sha256:..."),
+                text_input("NVKR_RELEASE_OUTPUT", label="NVKR disk output", default=_nvkr_release_output),
+                text_input("NICO_VMS_OS_IMAGE_URL", label="OS image URL (used when Pull NVKR release is off)", default="", placeholder="https://... or file:///..."),
+                text_input("NICO_VMS_OS_IMAGE_DESTINATION", label="nico-sim files destination (relative to /files)", default=_os_image_destination),
+            ],
+        )
+
+    _instance_backend_choices = []
+    if _vm_backend_enabled:
+        _instance_backend_choices.append("VM")
+    if _container_backend_enabled:
+        _instance_backend_choices.append("Container")
+    _default_instance_backend = "Container"
+    if _vm_backend_enabled:
+        _default_instance_backend = "VM"
+
+    # Manual CAPNICo instance controls. The buttons run the same scripts that can be
+    # called directly from the controller directory.
+    cmd_button(
+        "1-create-instance",
+        argv=["bash", "-c", """
+          set -euo pipefail
+          cd %s
+          INSTANCE_BACKEND="${INSTANCE_BACKEND:-%s}" \
+          INSTANCE_NAME="${INSTANCE_NAME:-}" \
+          RELEASE="${RELEASE:-nvke-260625-24.04-x86-fde}" \
+          INSTANCE_TYPE_ID="${INSTANCE_TYPE_ID:-}" \
+          DISK_SELECTION_STRATEGY="${DISK_SELECTION_STRATEGY:-smallest}" \
+          ./hack/capnico-create-instance.sh
+        """ % (ctx.main_dir, _default_instance_backend)],
+        resource="nico-sim",
+        icon_name="add_box",
+        text="Create instance",
+        inputs=[
+            choice_input("INSTANCE_BACKEND", label="Type", choices=_instance_backend_choices),
+            text_input("INSTANCE_NAME", label="Instance name (optional)", default="", placeholder="Uses the selected type's default name"),
+            text_input("RELEASE", label="NodePoolRelease (VM)", default="nvke-260625-24.04-x86-fde"),
+            text_input("INSTANCE_TYPE_ID", label="Instance type ID (optional)", default="", placeholder="Uses the selected type's default"),
+            text_input("DISK_SELECTION_STRATEGY", label="Disk strategy (VM)", default="smallest"),
+        ],
+    )
+
+    cmd_button(
+        "2-instance-status",
+        argv=["bash", "-c", """
+          set -euo pipefail
+          namespace="${NAMESPACE:-nico-test}"
+          instance_name="${INSTANCE_NAME:-capnico-vm-1}"
+
+          kubectl get cluster,nicocluster,machine,nicomachine -n "${namespace}"
+          echo
+          echo "nicomachine/${instance_name} ready: $(kubectl get nicomachine "${instance_name}" -n "${namespace}" -o jsonpath='{.status.ready}')"
+          echo "nicomachine/${instance_name} reason: $(kubectl get nicomachine "${instance_name}" -n "${namespace}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}')"
+        """],
+        resource="nico-sim",
+        icon_name="fact_check",
+        text="Instance status",
+        inputs=[
+            text_input("INSTANCE_NAME", default="capnico-vm-1"),
+            text_input("NAMESPACE", default="nico-test"),
+        ],
+    )
+
+    cmd_button(
+        "3-console-log",
+        argv=["bash", "-c", """
+          set -euo pipefail
+          namespace="${NAMESPACE:-nico-test}"
+          instance_name="${INSTANCE_NAME:-capnico-vm-1}"
+          instance_id="$(kubectl get machine "${instance_name}" -n "${namespace}" -o jsonpath='{.spec.providerID}' 2>/dev/null || true)"
+          instance_id="${instance_id#nico://}"
+          if [ -z "${instance_id}" ]; then
+            echo "providerID is not set yet -- no nico-sim instance for ${instance_name}." >&2
+            exit 1
+          fi
+
+          curl -fsS -H "Authorization: Bearer %s" \
+            "http://localhost:%s/v2/org/%s/forge/instance/${instance_id}/console-log"
+        """ % (ctx.nico_token, NICO_SIM_PORT, ctx.nico_org_id)],
+        resource="nico-sim",
+        icon_name="terminal",
+        text="Console log",
+        inputs=[
+            text_input("INSTANCE_NAME", default="capnico-vm-1"),
+            text_input("NAMESPACE", default="nico-test"),
+        ],
+    )
+
+    cmd_button(
+        "4-delete-instance",
+        argv=["bash", "-c", """
+          set -euo pipefail
+          cd %s
+          INSTANCE_BACKEND="${INSTANCE_BACKEND:-%s}" \
+          INSTANCE_NAME="${INSTANCE_NAME:-}" \
+          ./hack/capnico-delete-instance.sh
+        """ % (ctx.main_dir, _default_instance_backend)],
+        resource="nico-sim",
+        icon_name="delete",
+        text="Delete instance",
+        inputs=[
+            choice_input("INSTANCE_BACKEND", label="Type", choices=_instance_backend_choices),
+            text_input("INSTANCE_NAME", label="Instance name (optional)", default="", placeholder="Uses the selected type's default name"),
+        ],
+    )
+
+    # Host Promtail: ships nico-vms + VM console logs to Loki in K8s via port-forward.
+    if _observability:
+        local_resource(
+            "nico-sim-log-shipper",
+            serve_cmd=" ".join([
+                "docker rm -f nico-sim-promtail 2>/dev/null;",
+                "docker run --rm --name nico-sim-promtail",
+                "--network host",
+                "-v %s/logs:/var/log/nke:ro" % _dev,
+                "-v %s/instances:/var/log/vm-instances:ro" % _dev,
+                "-v %s/nico-vms-targets.json:/etc/promtail/nico-vms-targets.json:ro" % _dev,
+                "-v %s/promtail-host.yml:/etc/promtail/promtail.yml:ro" % _deploy,
+                "-v %s/promtail-positions:/var/lib/promtail" % _dev,
+                "grafana/promtail:3.3.2 -config.file=/etc/promtail/promtail.yml",
+            ]),
+            resource_deps=["port-forward-loki", "nico-sim"],
+            labels=["5-nico-sim"],
+        )
+
+
+    # -----------------------------------------------------------------------
+    # Convenience button: create a sample nico-vms-backed NVKE cluster.
+    # Defaults to 1 control-plane + 1 worker node using the seed resources.
+    # -----------------------------------------------------------------------
+    _controller_port = os.getenv("NVKE_CONTROLLER_HTTP_PORT", "") or "8080"
+    if _vm_backend_enabled:
+        cmd_button(
+            "5-create-sample-nico-vms-cluster",
+            argv=["bash", "-c", """
+              set -euo pipefail
+              if [ "$1" != "$2" ]; then
+                echo "The sample cluster requires NICO_VMS_OS_IMAGE_DESTINATION=$2; configured value is $1." >&2
+                exit 1
+              fi
+              cd %s
+              NVKE_CONTROLLER_HTTP_PORT="%s" \
+              CLUSTER_NAME="${CLUSTER_NAME:-nico-vms}" \
+              KUBERNETES_VERSION="${KUBERNETES_VERSION:-1.36.3}" \
+              CONTROL_PLANE_DESIRED_COUNT="${CONTROL_PLANE_DESIRED_COUNT:-1}" \
+              WORKER_DESIRED_COUNT="${WORKER_DESIRED_COUNT:-1}" \
+              CNI_PLUGIN="${CNI_PLUGIN:-ovn-kubernetes}" \
+              CNI_VERSION="${CNI_VERSION:-}" \
+              NICO_SIM_FILES_DIR="%s" \
+              NICO_VMS_IMAGE_CACHE_DIR="%s" \
+              NICO_VMS_OS_IMAGE_URL="${NICO_VMS_OS_IMAGE_URL:-}" \
+              ./hack/create-nico-vms-cluster.sh
+            """ % (
+                ctx.main_dir,
+                _controller_port,
+                _files_dir,
+                _image_cache_dir,
+            ), "sample-cluster", _os_image_destination, _default_os_image_destination],
+            resource="nvke-controller",
+            icon_name="add_box",
+            text="Create sample nico-vms cluster",
+            inputs=[
+                text_input("CLUSTER_NAME", label="Cluster name", default="nico-vms", placeholder="Name for the NVKE cluster"),
+                text_input("KUBERNETES_VERSION", label="Kubernetes version", default="1.36.3", placeholder="Tenant Kubernetes version"),
+                text_input("CONTROL_PLANE_DESIRED_COUNT", label="Control-plane nodes", default="1", placeholder="Number of control-plane VMs"),
+                text_input("WORKER_DESIRED_COUNT", label="Worker nodes", default="1", placeholder="Number of worker VMs"),
+                choice_input("CNI_PLUGIN", label="CNI plugin (calico is Linux only; macOS needs ovn-kubernetes)", choices=["ovn-kubernetes", "calico"]),
+                text_input("CNI_VERSION", label="CNI version (optional)", default="", placeholder="e.g. 1.4.0 (OVN) or 3.30.1 (Calico); empty = server default"),
+                text_input(
+                    "NICO_VMS_OS_IMAGE_URL",
+                    label="OS image URL (optional; blank uses /files/images/nvke-node.qcow2; stage it first)",
+                    default="",
+                    placeholder="https://... or file:///...",
+                ),
+            ],
+        )
+
+    return struct(
+        controller_resource_deps = ["nico-sim"],
+        controller_env_overrides = {},
+    )

@@ -1,0 +1,38 @@
+{{- with .Values.nvkeOIDCAuth.caBundleSecret }}
+{{- if and $.Values.nvkeOIDCAuth.enabled .namespace .name }}
+# The controller reads the OIDC discovery provider's upstream CA at kubeadm-render time
+# (readOIDCCABundle) and embeds it into the tenant apiserver AuthenticationConfiguration.
+# resourceName-scoped `get` on the single CA Secret, in whatever namespace the CA lives
+# (spire-server for Forge). Wired to the same caBundleSecret values the controller reads, so the
+# grant can't drift from the target.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "controller.fullname" $ }}-oidc-ca-read
+  namespace: {{ .namespace }}
+  labels:
+    {{- include "controller.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ .name }}
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "controller.fullname" $ }}-oidc-ca-read
+  namespace: {{ .namespace }}
+  labels:
+    {{- include "controller.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "controller.fullname" $ }}-oidc-ca-read
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "controller.serviceAccountName" $ }}
+    namespace: {{ include "controller.namespace" $ }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,256 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Unit-test lane for the controller modules. Until this existed, agent-test.yml
+# was the only workflow that ran `go test` anywhere in the repository, so
+# controller/, controller/nico-sim/ and nvkectl were compiled, linted,
+# vetted, CodeQL-scanned and govulncheck-scanned -- and never
+# tested. A test suite nothing runs reads as coverage in review and provides
+# none.
+#
+# Not covered by the test job, deliberately:
+# controller/hack/capd-reboot-controller has no _test.go files at all. The root
+# controller/test/e2e package mixes ordinary unit tests with TestE2E, which
+# needs a live cluster in KUBECONFIG; the job below skips only TestE2E.
+#
+# The `compile` job below covers those heavier suites in the one way a pull
+# request can: it type-checks them without running them. See its own comment.
+#
+# ⚠️ CGO_ENABLED=1 is set deliberately and this lane does not work without it.
+# #116 replaced modernc.org/sqlite (pure Go) with mattn/go-sqlite3 (a cgo
+# binding). Without cgo that package compiles to a stub that fails at the FIRST
+# QUERY rather than at build time, so 8 controller packages fail with
+# "requires cgo to work. This is a stub". A cross-compile disables cgo by
+# default too -- not only an explicit CGO_ENABLED=0 -- so this must stay
+# explicit rather than rely on a default.
+#
+# GitHub-hosted runners, not the self-hosted linux-*-cpu16 pool, for the reason
+# in agent-test.yml: self-hosted runners do not receive pull_request events, so
+# using them would cost coverage of fork and Dependabot pull requests.
+# ubuntu-latest ships a C toolchain, which is what cgo needs.
+
+name: Controller Unit Tests
+
+# Keep the push paths aligned with the test matrix below. `auth/**` and `cli/**`
+# are explicit because those modules sit outside `controller/**`.
+# workflow_call is what merge-gate.yml uses to call this as a reusable workflow.
+# Its own `pull_request:` trigger is gone: pull requests reach it through the
+# gate, so it runs once per pull request rather than twice.
+#
+# A called workflow does not apply its own `paths:` filter, so on a pull request
+# this runs whatever changed. That is deliberate -- see the note in
+# merge-gate.yml. The filter below still applies to `push`.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'controller/**'
+      - 'auth/**'
+      - 'cli/**'
+      - 'management-engine/**'
+      - 'go.work'
+      - 'go.work.sum'
+      - '.github/workflows/controller-test.yml'
+  workflow_call:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started. Five merges in
+  # three minutes cancelled 18 runs across 7 workflows this way, leaving
+  # three consecutive commits on main with no test result at all.
+  #
+  # Pull-request branches keep sharing a group and still cancel, which is
+  # what you want there.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so every workflow merge-gate.yml calls would
+  # compute the same group and cancel each other -- 8 of 9 calls died that way,
+  # reported to the gate as failures with no jobs and no error message.
+  group: Controller Unit Tests-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  # Do not cancel a run on main; the newer workflows here all guard this.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# A module fetch the proxy drops mid-stream falls back to the module's origin (#1481).
+env:
+  GOPROXY: https://proxy.golang.org|direct
+
+jobs:
+  test:
+    name: Unit tests (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: controller/api
+            run: make test
+          # `make test` here already drops ./integration-test, which needs a
+          # running controller on port 8080.
+          # test-integration-local adds the two `integration`-tagged packages.
+          # Neither needs a service, and until now nothing ran either: the
+          # tagged file in ./internal/agent was not even type-checked, because
+          # no target vetted that package with the tag.
+          - module: controller
+            run: make test test-integration-local
+          - module: controller/nico-sim
+            run: make test
+          - module: controller/deploy/charts
+            run: make test
+          - module: auth
+            run: make test
+          # Every module here has a Makefile with a `test` target, so all of
+          # them go through `make test` and pick up -race from GO_TEST_FLAGS
+          # below.
+          - module: cli
+            run: make test
+          - module: management-engine
+            run: make test
+          # The e2e module mixes the live Ginkgo suite with ordinary root and
+          # internal unit tests. Skip only TestE2E so every current and future
+          # root-package unit test runs without needing an allowlist. That is
+          # how the bare-binary fixture-path regression is caught cheaply.
+          - module: controller/test/e2e
+            run: make test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The e2e module's TestLayoutsMatchTheReleaseTags is the only test
+          # that checks the deploy-layout table against the tags the site
+          # lane actually exports from; without the tags here it skips, and
+          # the table could drift from every release unnoticed. The default
+          # shallow fetch is kept -- the test reads each tag's tree, which a
+          # depth-1 tag fetch carries, and skips any tag it cannot read.
+          fetch-tags: true
+
+      # Workspace mode (default) so tests resolve the root module graph.
+      # go.work carries the toolchain that satisfies every module.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            **/go.sum
+
+      # -race, the follow-up this step used to defer. It is what caught the
+      # regression in #116, and the reason for waiting -- not wanting a first
+      # red run to conflate two changes -- expired once the lane was green.
+      #
+      # Measured before enabling: the full controller suite passes with 0 data
+      # races, and the added time is tens of seconds against the 30-minute
+      # timeout above. CGO_ENABLED=1 was already required here and the race
+      # detector needs cgo too, so nothing else changes.
+      - name: Run unit tests
+        working-directory: ${{ matrix.module }}
+        env:
+          CGO_ENABLED: "1"
+          GO_TEST_FLAGS: -race
+        run: ${{ matrix.run }}
+
+  # Type-checks the heavier test variants that pull-request CI cannot execute.
+  # These suites need a cluster, a live API, real VMs or a fault-injection
+  # build, but CI can still prove they build against packages that keep moving.
+  #
+  # `go build ./...` does not cover this. It ignores _test.go entirely, and
+  # ignores any file behind a build tag nothing sets. So:
+  #
+  #   - controller/test/e2e is a separate module of test files with no
+  #     non-test package. The unit job above compiles the root package and runs
+  #     everything except the live TestE2E entrypoint; vet keeps an explicit
+  #     compile-only assertion for the whole suite.
+  #   - controller/e2e/... is behind `-tags gofail`; `go list ./e2e/...`
+  #     reports "matched no packages" without it.
+  #   - the nico-sim real-VM suites are behind `-tags integration` and need
+  #     libvirt or qemu, a bridge and a node image. The teleport and
+  #     internal/agent suites carry the same tag but need nothing, so the test
+  #     job above runs them for real rather than vetting them here.
+  #   - controller/integration-test is dropped from `make test` by a grep,
+  #     because it needs a controller on port 8080.
+  #
+  # go vet rather than `go build`: it type-checks test files, which is the
+  # point, and it is the cheapest thing that does.
+  compile:
+    name: Compile (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: test/e2e
+            dir: controller/test/e2e
+            run: go vet ./...
+          - name: test/e2e OIDC acceptance
+            dir: controller/test/e2e
+            run: GOWORK=off go test -c -tags oidc_acceptance -o /tmp/oidc-acceptance.test .
+          - name: e2e gofail
+            dir: controller
+            run: go vet -tags gofail ./e2e/...
+          - name: nico-sim integration
+            dir: controller/nico-sim
+            run: go vet -tags integration ./test/integration/...
+          - name: integration-test
+            dir: controller
+            # The package sits behind the `integration_test` build tag so a
+            # plain `go test ./...` no longer picks it up and fails on a
+            # refused connection to localhost:8080. Vet has to pass the tag,
+            # or it matches no packages and exits non-zero.
+            run: go vet -tags integration_test ./integration-test/...
+          - name: OIDC reference
+            dir: controller
+            run: go vet -tags oidc_integration ./test/oidctest/...
+          - name: kubeadm bringup
+            dir: controller/test/kubeadm
+            # The 2-VM nico-vms bringup driver, behind `kubeadm_bringup`. It
+            # only ever runs on a self-hosted runner with QEMU, in the
+            # advisory kubeadm-bringup-e2e.yml lane, so this is the sole
+            # check that keeps it compiling against packages that keep
+            # moving. Vetted from its own directory rather than as
+            # ./test/kubeadm/... from controller, so `./...` here matches the
+            # suite and its internal packages and nothing else.
+            # go test, not just vet, for the internal packages. They are
+            # ordinary unit tests with no VM or config requirement, and nothing
+            # ran them: two cloudinit tests pointed at a path that does not
+            # exist and failed on every invocation while CI stayed green.
+            # ./... is not usable here because the top-level suite calls
+            # t.Fatal when its VM configuration is absent.
+            run: |
+              go vet -tags kubeadm_bringup ./...
+              go test -tags kubeadm_bringup ./internal/...
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            **/go.sum
+
+      # Same reason as the test job: these packages reach mattn/go-sqlite3,
+      # which needs cgo.
+      - name: Type-check
+        working-directory: ${{ matrix.dir }}
+        env:
+          CGO_ENABLED: "1"
+        run: ${{ matrix.run }}

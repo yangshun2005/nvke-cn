@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# capd provider: declares that the cluster has Cluster API Provider Docker
+# (CAPD) installed for local development. Owns a preflight check fragment
+# asserting that capd-controller-manager is deployed.
+
+CAPD_CWE_RBAC_RESOURCE = "capd-cwe-rbac"
+
+def register(ctx):
+    _controller_resource_deps = []
+    _capd_cwe_rbac_manifest = os.path.join(ctx.provider_dir, "controller-rbac.yaml")
+
+    k8s_yaml(_capd_cwe_rbac_manifest)
+    k8s_resource(
+        new_name=CAPD_CWE_RBAC_RESOURCE,
+        labels=["5-capd"],
+        objects=[
+            "nvke-controller-capd:clusterrole",
+            "nvke-controller-capd:clusterrolebinding",
+        ],
+        resource_deps=["check-management-cluster"],
+        pod_readiness="ignore",
+    )
+    _controller_resource_deps.append(CAPD_CWE_RBAC_RESOURCE)
+
+    return struct(
+        controller_resource_deps = _controller_resource_deps,
+        controller_env_overrides = {},
+        preflight_script = """
+      kubectl get deployment -n capd-system capd-controller-manager >/dev/null 2>&1 || {
+        echo "CAPD controllers are not installed in the current cluster. Run 'make capd-up' first." >&2
+        exit 1
+      }
+""",
+    )

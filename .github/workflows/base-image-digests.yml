@@ -1,0 +1,255 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Base Image Digests
+
+# Follows the base images that Dependabot cannot see, and opens a pull request
+# when one of them has been republished.
+#
+# The two images this repository publishes name their golang and alpine bases
+# through `ARG <NAME>_IMAGE=docker.io/<image>:<tag>@sha256:<digest>`. The
+# `docker` ecosystem in .github/dependabot.yml reads an image named on a
+# `FROM` and does not resolve an ARG default, so those digests are watched by
+# nothing -- the evidence is in the header of hack/base-image-check.sh. Pinned
+# and unwatched means an upstream rebuild that fixes a CVE in the base layer
+# never reaches a release until somebody re-resolves the digest by hand.
+#
+# This is that re-resolution, weekly. It changes digests only, never tags, so
+# the Go version policy in dependabot.yml stays the only thing that decides
+# when a tag moves.
+#
+# Known rough edge: a `pull_request` run caused by GITHUB_TOKEN is created in an
+# approval-required state, so merge-gate.yml sits queued and the required `gate`
+# context does not report until somebody with write access chooses "Approve
+# workflows to run". The pull-request body says so too. Giving this job an app
+# token would remove the approval step; that is an organisation decision, not
+# one this workflow can make.
+on:
+  schedule:
+    # 07:15 UTC Monday. Clear of the E2E block (02:00-03:15, 14:00-15:15),
+    # os-image-prune at 05:40, codeql at 06:00 Monday and govulncheck at 06:30.
+    - cron: '15 7 * * 1'
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: Base Image Digests
+  cancel-in-progress: false
+
+env:
+  BRANCH: automation/base-image-digests
+
+jobs:
+  bump:
+    if: github.repository_id == '1323115536'
+    name: Re-resolve ARG-pinned base image digests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Moving the branch ref and committing to it through the API.
+      contents: write
+      # Opening the pull request for it.
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up crane
+        uses: ./.github/actions/setup-crane
+
+      # Writes the files and prints what moved. A registry it cannot reach, or
+      # an ARG pinned to a digest with no tag to re-resolve it from, fails here
+      # rather than producing a quietly empty pull request.
+      - name: Re-resolve digests
+        id: update
+        run: |
+          set -euo pipefail
+          report="${RUNNER_TEMP}/report.txt"
+          ./hack/base-image-update.sh | tee "${report}"
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          fi
+          echo "report=${report}" >> "${GITHUB_OUTPUT}"
+
+      # The script rewrites one `ARG ...=<ref>@sha256:<digest>` line per stale
+      # base and nothing else. Anything outside that shape is a bug in the
+      # script, and it fails here rather than landing in a pull request that
+      # reads as routine.
+      - name: Guard — refuse to commit anything but ARG digest lines
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          bad="$(git diff --name-only | grep -Ev 'Dockerfile(\..*)?$' || true)"
+          if [ -n "${bad}" ]; then
+            echo "::error::Refusing to commit files that are not Dockerfiles:"
+            printf '%s\n' "${bad}" | sed 's/^/    /'
+            exit 1
+          fi
+          # Every changed line, added or removed, must be an ARG digest pin.
+          offending="$(git diff -U0 | grep -E '^[+-][^+-]' \
+            | grep -Ev '^[+-]ARG [A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+@sha256:[0-9a-f]{64}$' || true)"
+          if [ -n "${offending}" ]; then
+            echo "::error::Refusing to commit changes outside ARG digest pins:"
+            printf '%s\n' "${offending}" | sed 's/^/    /'
+            exit 1
+          fi
+
+      # The digests the pull request proposes are the ones this verifies, which
+      # is worth doing here because the gate will not run on the pull request
+      # itself until somebody nudges it.
+      - name: Re-check the pins
+        if: steps.update.outputs.changed == 'true'
+        run: make base-image-check
+
+      # `main` requires verified signatures, and a commit written by `git` in a
+      # runner has none -- GITHUB_TOKEN authenticates the push, it does not sign
+      # the commit object. So the commit is created through the GraphQL
+      # `createCommitOnBranch` mutation instead, which GitHub signs with its own
+      # `web-flow` key on the way in. No signing key to hold or rotate; the cost
+      # is that the file contents travel as base64 in the mutation and the
+      # message carries its own sign-off.
+      - name: Commit as a signed commit
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # One `additions` entry per rewritten file. The guard above has
+          # already established that this list is Dockerfiles and nothing else,
+          # and the script only ever rewrites files -- it never deletes one, so
+          # `fileChanges` needs no `deletions`.
+          additions="$(git diff --name-only | while IFS= read -r f; do
+            jq -n --arg path "${f}" --arg contents "$(base64 -w0 <"${f}")" \
+              '{path: $path, contents: $contents}'
+          done | jq -s '.')"
+
+          # The proposal is built on a scratch ref and published only once it
+          # verifies. A rerun has to replace last week's proposal rather than
+          # stack onto it -- what `push --force` did before -- but resetting
+          # ${BRANCH} to ${BASE_SHA} up front means a failure in the mutation
+          # or in the verification below leaves an already-open pull request
+          # pointing at a branch with no proposal on it until a later run
+          # recovers.
+          candidate="${BRANCH}-${GITHUB_RUN_ID}"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/heads/${candidate}" -f "sha=${BASE_SHA}" >/dev/null
+          cleanup() {
+            gh api -X DELETE \
+              "repos/${GITHUB_REPOSITORY}/git/refs/heads/${candidate}" \
+              >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          # `git commit -s` wrote the trailer before; the mutation takes the
+          # whole message, so the sign-off is spelled out here. It has to match
+          # the author GitHub attributes the commit to -- the token's actor --
+          # or the required DCO context fails.
+          payload="${RUNNER_TEMP}/commit.json"
+          jq -n \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg branch "${candidate}" \
+            --arg oid "${BASE_SHA}" \
+            --argjson additions "${additions}" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: {
+                input: {
+                  branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+                  expectedHeadOid: $oid,
+                  message: {
+                    headline: "build(deps): bump ARG-pinned base image digests",
+                    body: "Signed-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+                  },
+                  fileChanges: {additions: $additions}
+                }
+              }
+            }' >"${payload}"
+
+          oid="$(gh api graphql --input "${payload}" \
+            --jq '.data.createCommitOnBranch.commit.oid')"
+          if [ -z "${oid}" ]; then
+            echo "::error::createCommitOnBranch returned no commit."
+            exit 1
+          fi
+          echo "Committed ${oid} on ${candidate}."
+
+          # The whole point of the mutation is the signature, so fail loudly
+          # rather than open a pull request that cannot be merged.
+          verified="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${oid}" \
+            --jq '.commit.verification.verified')"
+          if [ "${verified}" != "true" ]; then
+            reason="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${oid}" \
+              --jq '.commit.verification.reason')"
+            echo "::error::Commit ${oid} is not verified (${reason}); main requires" \
+                 "verified signatures, so this would not be mergeable."
+            exit 1
+          fi
+
+          # Verified, so publish it. Moving the ref keeps an open pull request
+          # attached to it; deleting and recreating the ref would close it.
+          if ! gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+              -f "sha=${oid}" -F force=true >/dev/null 2>&1; then
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/heads/${BRANCH}" -f "sha=${oid}" >/dev/null
+          fi
+
+      - name: Open or update the pull request
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPORT: ${{ steps.update.outputs.report }}
+        run: |
+          set -euo pipefail
+
+          body="${RUNNER_TEMP}/body.md"
+          {
+            echo "Upstream republished the tags below, so the digest pinned here"
+            echo "no longer resolves to what the tag serves. Tags are unchanged;"
+            echo "only the digests move."
+            echo
+            echo '```'
+            cat "${REPORT}"
+            echo '```'
+            echo
+            echo "Opened by [base-image-digests.yml](.github/workflows/base-image-digests.yml)."
+            echo "Dependabot cannot see these bases because they are named through an"
+            echo "\`ARG\` default rather than on a \`FROM\`; the evidence is in the header"
+            echo "of \`hack/base-image-check.sh\`."
+            echo
+            echo "**The gate is waiting to be approved.** A \`pull_request\` run caused"
+            echo "by \`GITHUB_TOKEN\` is created in an approval-required state. Someone with"
+            echo "write access needs to approve the queued \`merge-gate.yml\` run before the"
+            echo "required \`gate\` context reports."
+          } >"${body}"
+
+          existing="$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            gh pr edit "${existing}" --body-file "${body}"
+            echo "Updated #${existing}."
+            exit 0
+          fi
+
+          # A repository or organisation that disallows Actions-created pull
+          # requests fails here. The branch is already pushed either way, so
+          # the work is not lost -- open the pull request by hand.
+          if ! gh pr create \
+            --head "${BRANCH}" \
+            --base main \
+            --title "build(deps): bump ARG-pinned base image digests" \
+            --body-file "${body}"; then
+            echo "::error::Could not open the pull request. If this says pull request" \
+                 "creation is not allowed, enable 'Allow GitHub Actions to create and" \
+                 "approve pull requests' for this repository. Branch ${BRANCH} is pushed."
+            exit 1
+          fi
+
+      - name: Nothing to do
+        if: steps.update.outputs.changed != 'true'
+        run: echo "Every ARG-pinned base image digest is current."

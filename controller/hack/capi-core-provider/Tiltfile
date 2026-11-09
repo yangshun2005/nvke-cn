@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# capi-core provider: declares that the cluster has Cluster API core installed.
+#
+# This provider has no Tilt resources of its own — it owns a preflight check
+# fragment asserting that capi-controller-manager is deployed.
+
+def register(ctx):
+    return struct(
+        controller_resource_deps = [],
+        controller_env_overrides = {},
+        preflight_script = """
+      kubectl get deployment -n capi-system capi-controller-manager >/dev/null 2>&1 || {
+        echo "CAPI controllers are not installed in the current cluster. Run 'make capi-core-up' (or 'make capd-up') first." >&2
+        exit 1
+      }
+""",
+    )

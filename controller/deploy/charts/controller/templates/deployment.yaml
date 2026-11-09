@@ -1,0 +1,379 @@
+{{- $spireAttestationMethod := required "nodeAgent.spireAttestationMethod is required" .Values.nodeAgent.spireAttestationMethod }}
+{{- if not (has $spireAttestationMethod (list "tpm" "joinToken" "dsxImds")) }}
+{{- fail (printf "nodeAgent.spireAttestationMethod must be one of tpm, joinToken, or dsxImds, got %q" $spireAttestationMethod) }}
+{{- end }}
+{{- $dsxIMDSEndpoint := .Values.nodeAgent.dsxImds.endpoint }}
+{{- $dsxIMDSOperatorTenant := .Values.nodeAgent.dsxImds.operatorTenant }}
+{{- if and (eq $spireAttestationMethod "dsxImds") (eq (trim $dsxIMDSOperatorTenant) "") }}
+{{- fail "nodeAgent.dsxImds.operatorTenant is required when nodeAgent.spireAttestationMethod is dsxImds" }}
+{{- end }}
+{{- if and (eq $spireAttestationMethod "dsxImds") (or (not (regexMatch "^[A-Za-z0-9._-]+$" (trim $dsxIMDSOperatorTenant))) (has (trim $dsxIMDSOperatorTenant) (list "." ".."))) }}
+{{- fail "nodeAgent.dsxImds.operatorTenant must be a valid SPIFFE path segment" }}
+{{- end }}
+{{- if and (eq $spireAttestationMethod "dsxImds") (eq (trim $dsxIMDSEndpoint) "") }}
+{{- fail "nodeAgent.dsxImds.endpoint is required when nodeAgent.spireAttestationMethod is dsxImds" }}
+{{- end }}
+{{- if eq $spireAttestationMethod "dsxImds" }}
+{{- $parsedDSXIMDSEndpoint := urlParse (trim $dsxIMDSEndpoint) }}
+{{- if or (not (has (lower (get $parsedDSXIMDSEndpoint "scheme")) (list "http" "https"))) (eq (get $parsedDSXIMDSEndpoint "host") "") }}
+{{- fail "nodeAgent.dsxImds.endpoint must be an absolute HTTP(S) URL with a host" }}
+{{- end }}
+{{- end }}
+{{- $dsxIMDSPluginChecksum := .Values.nodeAgent.dsxImds.pluginChecksum }}
+{{- if and (eq $spireAttestationMethod "dsxImds") (ne $dsxIMDSPluginChecksum "") (not (regexMatch "^[0-9A-Fa-f]{64}$" $dsxIMDSPluginChecksum)) }}
+{{- fail "nodeAgent.dsxImds.pluginChecksum must be empty or a 64-character SHA-256 hex digest" }}
+{{- end }}
+{{- if and (eq $spireAttestationMethod "joinToken") (not .Values.spiffe.enabled) }}
+{{- fail "spiffe.enabled must be true when nodeAgent.spireAttestationMethod is joinToken" }}
+{{- end }}
+{{- if and (eq $spireAttestationMethod "dsxImds") (not .Values.spiffe.enabled) }}
+{{- fail "spiffe.enabled must be true when nodeAgent.spireAttestationMethod is dsxImds" }}
+{{- end }}
+{{- /* The method is deployment-wide, and a SPIFFE-enabled LaunchLayer node attests only through dsx_imds. */}}
+{{- if and (include "controller.launchLayerEnabled" .) .Values.spiffe.enabled (ne $spireAttestationMethod "dsxImds") }}
+{{- fail (printf "nodeAgent.spireAttestationMethod must be dsxImds when supportedInfraProviders includes launchLayer and spiffe.enabled is true, got %q" $spireAttestationMethod) }}
+{{- end }}
+{{- include "controller.renamedValues.validate" . }}
+{{- include "controller.apiAuth.validate" . }}
+{{- include "controller.controllerConfig.validateEnv" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "controller.fullname" . }}
+  namespace: {{ include "controller.namespace" . }}
+  labels:
+    {{- include "controller.labels" . | nindent 4 }}
+  {{- $reloadSecrets := list }}
+  {{- $reloadConfigMaps := list }}
+  {{- if and .Values.secrets.dgxcTenantCredSecretName (not (hasKey (default dict .Values.deploymentAnnotations) "secret.reloader.stakater.com/reload")) }}
+  {{- $reloadSecrets = append $reloadSecrets .Values.secrets.dgxcTenantCredSecretName }}
+  {{- end }}
+  {{- if and .Values.secrets.cnpgDbPasswordsSecretName (not (hasKey (default dict .Values.deploymentAnnotations) "secret.reloader.stakater.com/reload")) }}
+  {{- $reloadSecrets = append $reloadSecrets .Values.secrets.cnpgDbPasswordsSecretName }}
+  {{- end }}
+  {{- if and .Values.nodeAgent.externalMTLS.enabled (not (hasKey (default dict .Values.deploymentAnnotations) "secret.reloader.stakater.com/reload")) }}
+  {{- $reloadSecrets = append $reloadSecrets (required "nodeAgent.externalMTLS.secret.name is required when external mTLS is enabled" .Values.nodeAgent.externalMTLS.secret.name) }}
+  {{- end }}
+  {{- if and .Values.apiAuth.enabled (not (hasKey (default dict .Values.deploymentAnnotations) "configmap.reloader.stakater.com/reload")) }}
+  {{- $reloadConfigMaps = append $reloadConfigMaps .Values.apiAuth.configMap.name }}
+  {{- end }}
+  {{- if not (hasKey (default dict .Values.deploymentAnnotations) "configmap.reloader.stakater.com/reload") }}
+  {{- $reloadConfigMaps = append $reloadConfigMaps (include "controller.controllerConfig.name" .) }}
+  {{- end }}
+  {{- if or .Values.deploymentAnnotations $reloadSecrets $reloadConfigMaps }}
+  annotations:
+    {{- with .Values.deploymentAnnotations }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+    {{- if $reloadSecrets }}
+    secret.reloader.stakater.com/reload: {{ join "," $reloadSecrets | quote }}
+    {{- end }}
+    {{- if $reloadConfigMaps }}
+    configmap.reloader.stakater.com/reload: {{ join "," $reloadConfigMaps | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "controller.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      {{- $podAnnotations := dict }}
+      {{- with .Values.podAnnotations }}
+      {{- $podAnnotations = . | deepCopy }}
+      {{- end }}
+      {{- if and .Values.tracing.enabled .Values.tracing.operatorInject.enabled }}
+      {{- with .Values.tracing.operatorInject.injectSdk }}
+      {{- $_ := set $podAnnotations "instrumentation.opentelemetry.io/inject-sdk" . }}
+      {{- end }}
+      {{- with .Values.tracing.operatorInject.injectSidecar }}
+      {{- $_ := set $podAnnotations "sidecar.opentelemetry.io/inject" . }}
+      {{- end }}
+      {{- end }}
+      {{- if $podAnnotations }}
+      annotations:
+        {{- toYaml $podAnnotations | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "controller.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "controller.serviceAccountName" . }}
+      {{- if .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- end }}
+      {{- $profilesImage := "" }}
+      {{- if .Values.profiles.image.enabled }}
+      {{- if not .Values.profiles.path }}
+      {{- fail "profiles.path is required when profiles.image.enabled=true" }}
+      {{- end }}
+      {{- $profilesImage = required "profiles.image.repository is required when profiles.image.enabled=true" .Values.profiles.image.repository }}
+      {{- if .Values.profiles.image.digest }}
+      {{- $profilesImage = printf "%s@%s" $profilesImage .Values.profiles.image.digest }}
+      {{- else if .Values.profiles.image.tag }}
+      {{- $profilesImage = printf "%s:%s" $profilesImage .Values.profiles.image.tag }}
+      {{- else }}
+      {{- fail "profiles.image.digest or profiles.image.tag is required when profiles.image.enabled=true" }}
+      {{- end }}
+      {{- end }}
+      {{- if or .Values.profiles.image.enabled .Values.additionalInitContainers }}
+      initContainers:
+        {{- if .Values.profiles.image.enabled }}
+        - name: materialize-profiles
+          image: {{ $profilesImage | quote }}
+          {{- /* The controller container's restrictions: the copy writes only
+          to the profiles emptyDir, so it needs no capability, escalation or
+          writable root either. */}}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              # Image content is at /profiles. Mount emptyDir elsewhere so we
+              # do not hide the source tree, then copy into the shared volume.
+              # The app container mounts the same volume at profiles.path.
+              # -R, not -a: the pod runs unprivileged, so preserving the
+              # image's root ownership fails on every file.
+              cp -R /profiles/. /profiles-out/
+          volumeMounts:
+            - name: profiles
+              mountPath: /profiles-out
+        {{- end }}
+        {{- with .Values.additionalInitContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        {{- /* The name helper, not .Chart.Name: the chart is named `nvke-controller`
+        for its OCI path, and a bare .Chart.Name would rename this container on
+        upgrade, breaking every `kubectl logs -c` and log/metric selector keyed
+        on it. */}}
+        - name: {{ include "controller.name" . }}
+          {{- with .Values.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}{{ with .Values.image.digest }}@{{ . }}{{ end }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: nvke-controller-config
+              mountPath: {{ include "controller.controllerConfig.mountPath" . | quote }}
+              readOnly: true
+            {{- if .Values.nodeAgent.externalMTLS.enabled }}
+            - name: node-agent-client-tls
+              mountPath: /etc/nvke/node-agent-client-tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.apiAuth.enabled }}
+            - name: nvke-auth-config
+              mountPath: {{ include "controller.apiAuth.mountPath" . | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.profiles.image.enabled }}
+            - name: profiles
+              mountPath: {{ .Values.profiles.path | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.spiffe.enabled }}
+            - name: spiffe-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+            {{- end }}
+            {{- if .Values.temporal.mtls.enabled }}
+            - name: temporal-client-certs
+              mountPath: {{ .Values.temporal.mtls.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.teleport.enabled }}
+            - name: teleport-identity
+              mountPath: /var/run/teleport
+              readOnly: true
+            {{- end }}
+            {{- with .Values.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # DB
+            {{- if or .Values.secrets.createDbSecret .Values.secrets.dbSecretName }}
+            - name: DB_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (printf "%s-%s" (include "controller.fullname" .) "db")  .Values.secrets.dbSecretName}}
+                  key:  {{ default "database-connection-string" .Values.secrets.dbSecretKey }}
+            {{- else }}
+            - name: DB_CONNECTION_STRING
+              value: {{ printf "postgres://%s:%s@%s/%s?sslmode=%s" .Values.appDb.postgresUser (default "placeholder" .Values.appDb.postgresPassword) .Values.appDb.url .Values.appDb.dbName (default "disable" .Values.appDb.sslMode) | quote }}
+            {{- end }}
+            # Not in nvke-controller-config: its default comes from the downward API.
+            - name: SPIRE_SERVER_ADDRESS
+              {{- if .Values.spiffe.spire.serverAddress }}
+              value: {{ .Values.spiffe.spire.serverAddress | quote }}
+              {{- else if .Values.spiffe.spire.serverAddressFrom }}
+              valueFrom:
+                {{- toYaml .Values.spiffe.spire.serverAddressFrom | nindent 16 }}
+              {{- else }}
+              {{- fail "Either spiffe.spire.serverAddress or spiffe.spire.serverAddressFrom must be set" }}
+              {{- end }}
+            {{- if .Values.secrets.dgxcTenantCredSecretName }}
+            - name: DGXC_TENANT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.dgxcTenantCredSecretName }}
+                  key: user
+                  optional: true
+            - name: DGXC_TENANT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.dgxcTenantCredSecretName }}
+                  key: password
+                  optional: true
+            {{- end }}
+            {{- if .Values.secrets.cnpgDbPasswordsSecretName }}
+            # CNPG database passwords. Required (optional=false): the controller fails
+            # closed at startup if these are unset (see
+            # cloud-workflow-engine!772 Validate()), so a missing key here
+            # should surface as a clear Kubernetes secretKeyRef error rather
+            # than a silently-empty env var and a confusing app-level failure.
+            - name: CNPG_SUPERUSER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.cnpgDbPasswordsSecretName }}
+                  key: CNPG_SUPERUSER_PASSWORD
+                  optional: false
+            - name: CNPG_CLOUD_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.cnpgDbPasswordsSecretName }}
+                  key: CNPG_CLOUD_PASSWORD
+                  optional: false
+            - name: CNPG_TEMPORAL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.cnpgDbPasswordsSecretName }}
+                  key: CNPG_TEMPORAL_PASSWORD
+                  optional: false
+            {{- end }}
+            - name: CONTROLLER_CONFIG_PATH
+              value: {{ printf "%s/%s" (include "controller.controllerConfig.mountPath" .) (include "controller.controllerConfig.file" .) | quote }}
+            {{- if and .Values.apiAuth.enabled (not .Values.apiAuth.configMap.create) }}
+            # Only for a ConfigMap managed elsewhere: a configuration the chart
+            # renders reaches the controller as apiAuth in the settings
+            # ConfigMap, and setting both is a startup failure. Omitted
+            # otherwise, never set empty: NVKE reads an empty value as unset, so
+            # the deployment would look configured and authenticate nobody.
+            - name: AUTH_CONFIG_PATH
+              value: {{ printf "%s/%s" (include "controller.apiAuth.mountPath" .) (include "controller.apiAuth.configFile" .) | quote }}
+            {{- end }}
+            {{- range .Values.env }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+      volumes:
+        # Not optional, like nvke-auth-config below.
+        - name: nvke-controller-config
+          configMap:
+            name: {{ include "controller.controllerConfig.name" . }}
+        {{- if .Values.nodeAgent.externalMTLS.enabled }}
+        - name: node-agent-client-tls
+          secret:
+            secretName: {{ required "nodeAgent.externalMTLS.secret.name is required when external mTLS is enabled" .Values.nodeAgent.externalMTLS.secret.name }}
+            items:
+              - key: {{ required "nodeAgent.externalMTLS.secret.certificateKey is required when external mTLS is enabled" .Values.nodeAgent.externalMTLS.secret.certificateKey }}
+                path: tls.crt
+              - key: {{ required "nodeAgent.externalMTLS.secret.privateKeyKey is required when external mTLS is enabled" .Values.nodeAgent.externalMTLS.secret.privateKeyKey }}
+                path: tls.key
+              - key: {{ required "nodeAgent.externalMTLS.secret.caBundleKey is required when external mTLS is enabled" .Values.nodeAgent.externalMTLS.secret.caBundleKey }}
+                path: ca.crt
+              {{- if or .Values.nodeAgent.externalMTLS.secret.newCertificateKey .Values.nodeAgent.externalMTLS.secret.newPrivateKeyKey }}
+              - key: {{ required "nodeAgent.externalMTLS.secret.newCertificateKey is required when the new-form identity is configured" .Values.nodeAgent.externalMTLS.secret.newCertificateKey }}
+                path: nvke-tls.crt
+              - key: {{ required "nodeAgent.externalMTLS.secret.newPrivateKeyKey is required when the new-form identity is configured" .Values.nodeAgent.externalMTLS.secret.newPrivateKeyKey }}
+                path: nvke-tls.key
+              {{- end }}
+        {{- end }}
+        {{- if .Values.profiles.image.enabled }}
+        - name: profiles
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.spiffe.enabled }}
+        - name: spiffe-workload-api
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+        {{- end }}
+        {{- if .Values.temporal.mtls.enabled }}
+        - name: temporal-client-certs
+          secret:
+            secretName: {{ required "temporal.mtls.secretName is required when temporal.mtls.enabled=true" .Values.temporal.mtls.secretName }}
+        {{- end }}
+        {{- if .Values.teleport.enabled }}
+        - name: teleport-identity
+          secret:
+            secretName: {{ .Values.teleport.identitySecretName }}
+        {{- end }}
+        {{- if .Values.apiAuth.enabled }}
+        # Not optional: a missing ConfigMap holds the pod in ContainerCreating
+        # with the name in its events, rather than starting it unconfigured.
+        - name: nvke-auth-config
+          configMap:
+            name: {{ required "apiAuth.configMap.name is required when apiAuth.enabled=true" .Values.apiAuth.configMap.name }}
+        {{- end }}
+        {{- with .Values.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

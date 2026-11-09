@@ -1,0 +1,112 @@
+# Build artifacts. `go build ./...` inside a module drops the binary in the
+# module directory; `make build` puts them all in bin/ instead.
+agent/agent
+controller/hack/capd-reboot-controller/capd-reboot-controller
+**/*.test
+**/bin/
+# Separate from **/bin/ on purpose: a leading dot is not matched by that
+# pattern, and 141 MB of downloaded tools reached main through exactly this
+# gap.
+**/.bin/
+**/dist/
+**/release/
+# The root release/ is tracked: it holds release tooling, not build output.
+# The rule above still catches a nested release/ a build drops somewhere, which
+# is what it was written for. Re-including the directory is what makes this
+# work -- git does not descend into an excluded directory, so a negation naming
+# a file inside it would never match.
+!/release/
+
+# `qualify plan --output plan.json`, written at the checkout root. Anchored to
+# the root, since --output defaults to stdout and a run has to ask for the file
+# by name.
+/plan.json
+
+# Coverage output and local cluster credentials.
+*.out
+*.kubeconfig
+
+# Go workspace dependencies may be vendored locally for offline remote tests,
+# but the generated tree is not committed.
+/vendor/
+
+# Reference-image Packer output and build-only SSH keys / pulled binaries.
+os-image/packer/output/
+os-image/packer/output-fde/
+os-image/packer/output-non-fde/
+os-image/packer/artifacts/
+os-image/packer/.artifacts.tmp.*/
+os-image/packer/.artifacts.backup.*/
+os-image/packer/.packer-inputs/
+os-image/packer/.packer-inputs.tmp.*/
+os-image/packer/.packer-output/
+os-image/packer/.packer-output-fde/
+os-image/packer/.packer-output-non-fde/
+os-image/packer/iso-cache/
+os-image/packer/build-logs/
+os-image/packer/.ssh/
+
+# qcow-imager.efi build. .infra-controller/ is the pinned upstream checkout the
+# build runs in; it also holds mkosi's package cache, which is most of the disk.
+os-image/efi/.infra-controller/
+os-image/efi/output/
+
+# Personal environment read by .envrc. It holds credentials, so the ignore has to
+# sit wherever .envrc does. The rule was in controller/.gitignore and scoped to
+# that directory.
+.env.local
+
+# Editor / OS
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+
+# go.work and go.work.sum are tracked, not ignored. The usual advice to keep a
+# Per-checkout tool caches and scratch output. controller/.gitignore already
+# ignores its own .local/; make/golangci.mk puts the golangci-lint cache in this
+# one so two checkouts cannot replay each other's issues.
+.local/
+# Python bytecode from running the hack/ scripts and their tests locally.
+__pycache__/
+
+# workspace local applies to a workspace that papers over module boundaries
+# during development; this one is the build definition for every module that
+# releases, and CI verifies it is current (`make work-check`).
+
+# The etcd encryption key `nvkectl bootstrap site` writes, and the temporary
+# file it is assembled in: into the working directory by default, so the rule
+# lives at the root. Both patterns are needed; the first cannot match a
+# leading-dot name.
+*-etcd-encryption-key.json
+.*-etcd-encryption-key.json.*
+cli/e2e/bootstrap/.etcd-encryption-key.json
+
+# The secret values the bootstrap E2E's Go test saves, in clear. See cli/.gitignore.
+cli/e2e/bootstrap/.bootstrap-known-secrets.json
+
+# nvkectl and the three image archives `make site-inputs` stages for the Forge
+# site-controller lane. The lane points SITE_INPUTS here, inside the checkout,
+# so the workspace rather than a $HOME cache owns them -- see the env block in
+# qualify-e2e.yml. Hundreds of megabytes of docker save output.
+.site-inputs/
+
+# What the Forge lane's `go test` leaves in the e2e directory. qualify-e2e.report.json and
+# the diagnostics tarball carry captured spec output, which on this lane is
+# remote command output, so an accidental commit is a disclosure rather than
+# noise.
+controller/test/e2e/qualify-e2e.log
+controller/test/e2e/qualify-e2e.junit.xml
+controller/test/e2e/qualify-e2e.report.json
+controller/test/e2e/nvkectl-diagnostics.tar.gz
+controller/test/e2e/site-cluster-state.txt
+controller/test/e2e/tenant-diagnostics.json
+controller/test/e2e/site-bundle*
+
+# Coverage profiles. make/coverage.mk points every module's `go test` here, and
+# hack/coverage.sh reads the directory. Nothing in it is committed: a profile
+# describes one run on one machine, and CI uploads it as an artifact instead.
+/coverage/

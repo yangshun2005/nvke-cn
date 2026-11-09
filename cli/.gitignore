@@ -1,0 +1,40 @@
+bin/
+/nvkectl
+/nvkectl.exe
+
+# E2E scratch: the bootstrap CA the substrate generates (see
+# e2e/bootstrap/substrate/ca.go). A private key, and reproducible on demand.
+.local/
+
+# E2E scratch: the node CSV and the site spec run.sh generates from it, both
+# carrying live TPM thumbprints.
+e2e/bootstrap/.hosts.csv
+e2e/bootstrap/.sitespec.rendered.yaml
+
+# E2E scratch of run-nico.sh: its site spec and bootstrap log, and the FRR
+# config it renders. The script removes them on exit; an aborted run leaves them.
+e2e/bootstrap/.sitespec.nico.rendered.yaml
+e2e/bootstrap/.bootstrap-nico.log
+e2e/bootstrap/.bgp-nico/
+
+# E2E scratch: what the Go test that runs `bootstrap site` prints about the run
+# itself. nvkectl's own output is in the bootstrap log beside it.
+e2e/bootstrap/.bootstrap-go-test.log
+e2e/bootstrap/.bootstrap-nico-go-test.log
+
+# The etcd encryption key `nvkectl bootstrap site` writes, the temporary file
+# it is assembled in, and the E2E's copy next to the site spec. The root
+# .gitignore carries the same rules for a bootstrap run from anywhere else.
+*-etcd-encryption-key.json
+.*-etcd-encryption-key.json.*
+e2e/bootstrap/.etcd-encryption-key.json
+
+# The secret values the bootstrap E2E's Go test saves for the search at the end
+# of the lane: the generated Postgres password and etcd key, in clear. An aborted
+# run can leave it behind. The root .gitignore carries the same rule.
+e2e/bootstrap/.bootstrap-known-secrets.json
+
+# E2E scratch: the cluster dump `nvkectl bootstrap site` collects when a
+# bootstrap fails, and CI uploads as an artifact. Regenerated on every
+# failing run.
+cluster-diagnostics/

@@ -1,0 +1,334 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# nico-vms backend E2E: the only lane that runs the nico-vms specs, on real KVM
+# tenant nodes booted from the NVKE FDE image. Body: controller/hack/ci/nico-vms-e2e.sh,
+# host mode, because nico-vms needs libvirt, the host bridge and CAP_NET_ADMIN.
+# Advisory. A happy-path run takes 40 minutes on arm64 and 90 on amd64, so the
+# push paths are only the lane's own inputs, and a mirror-branch run is skipped
+# unless the pull request itself touches them; everything else the lane depends
+# on is covered by the twice-daily schedule. Mirror-branch pushes are the PR
+# trigger; self-hosted runners get no pull_request events.
+#
+# Two legs, one per architecture, both on the self-hosted fleet's KVM scale
+# sets (arm64 gained nested KVM in #797). Both resolve their node image from
+# GHCR rather than the profile's CloudFront URL, which the fleet answers 403 to. Both went green in
+# #804, so a failure on either is a regression.
+
+name: NICo VMs E2E
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+    paths:
+      - "controller/nico-sim/**"
+      - "controller/hack/nico-provider/**"
+      - "controller/hack/ci/nico-vms-e2e.sh"
+      - controller/hack/backend-e2e-lib.sh
+      # This lane runs the nvkectl smoke, and is the only one that exercises its
+      # host-mode branch.
+      - "controller/hack/ci/nvkectl-smoke.sh"
+      - "controller/test/kubeadm/scripts/**"
+      # The Tiltfile is the lane's controller deployment recipe (#683).
+      - controller/Tiltfile
+      # The default OVN topology is the behavioral gate for the typed
+      # Open vSwitch provisioning path.
+      - "agent/internal/agent/open_vswitch*.go"
+      - "agent/pkg/agent/proto/node_agent.proto"
+      - "controller/internal/temporal/activities/configure_open_vswitch.go"
+      - "controller/internal/temporal/workflows/provision_node.go"
+      - "controller/test/e2e/**"
+      # Without these, a change to the lane's own definition or its gate does
+      # not run it.
+      - .github/workflows/nico-vms-e2e.yml
+      - .github/workflows/e2e-pr-path-filter.yml
+      - hack/e2e-path-filter.py
+      # Installs the pinned kind and kubectl the suite runs on.
+      - .github/actions/setup-kind/**
+  # Twice a day, like the other E2E lanes, half an hour after the kubeadm
+  # bring-up lane's slot so the two do not queue on the same runner. A schedule
+  # ignores the paths above, so these runs catch changes to the suite, the
+  # fixtures and the Tiltfiles within twelve hours.
+  schedule:
+    - cron: '0 3,15 * * *'
+  workflow_dispatch:
+    inputs:
+      label-filter:
+        description: >-
+          Ginkgo label filter. Empty runs what the schedule runs, which is the
+          per-leg filter in the matrix below. Set a value to narrow it, e.g.
+          'nico-vms && happy-path' for the 15 happy-path specs.
+        required: false
+        default: ''
+        type: string
+      os-image-tag:
+        description: "Pin every leg to one node image, e.g. v0.1.0-rc.1. The tag needs an image for each architecture the run covers, because each leg appends its own. Empty is usually what you want: it resolves the newest per architecture."
+        required: false
+        default: ""
+        type: string
+
+permissions: {}
+
+concurrency:
+  # A literal name, never ${{ github.workflow }} -- in a called workflow that is
+  # the caller's name and cancels its siblings. See merge-gate.yml:79-82.
+  # The sha keeps main runs apart. Sharing one group, and main never cancels,
+  # means a second main run waits out the first. Only the second: GitHub keeps
+  # one pending run per group, so a third arrival evicts the queued second.
+  group: NICo VMs E2E-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # A mirror-branch push carries base-branch commits too, so the paths above
+  # fire for every pull request updated after a nico-vms change lands on main.
+  # Re-read the pull request's own file list first (#474 did this for the NICo
+  # lane); main, the schedule and dispatch pass through untouched.
+  changes:
+    uses: ./.github/workflows/e2e-pr-path-filter.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  nico-vms-e2e:
+    name: nico-vms-e2e (${{ matrix.arch }}, KVM)
+    runs-on: ${{ matrix.runner }}
+    needs: changes
+    if: github.repository_id == '1323115536' && needs.changes.outputs.run_e2e == 'true'
+    strategy:
+      # One architecture failing must not hide the other's result.
+      fail-fast: false
+      # Both legs run on the ARC KVM scale sets of the RelEng EKS fleet,
+      # arc-amd64-kvm and arc-arm64-kvm. amd64 used linux-amd64-gpu-l4-latest-1,
+      # a 12-vCPU VM that nested the tenant VMs and held a GPU this lane never
+      # uses, because the GPU specs are filtered out below.
+      matrix:
+        include:
+          - arch: amd64
+            runner: arc-amd64-kvm
+            # !gpu and not !tpm-attestation: the guests carry an emulated TPM
+            # (swtpm) and no GPU.
+            label_filter: 'nico-vms && (happy-path || multi-pod-cidrs) && !gpu'
+          - arch: arm64
+            # Back on the ARC fleet, same root cause and fix as
+            # kubeadm-bringup-e2e; see setup-ci-host.sh.
+            runner: arc-arm64-kvm
+            # arm64 also carries parallel-lifecycle (OVN and Calico tenants side
+            # by side) and the ovn smoke, which asserts the typed Open vSwitch
+            # node-agent RPC and NetworkPolicy enforcement, because it is the
+            # faster leg -- see the timing note below.
+            label_filter: 'nico-vms && (happy-path || parallel-lifecycle || ovn || multi-pod-cidrs) && !gpu'
+    # Happy path in #804: arm64 41m, amd64 1h31m. Generous for the wider label
+    # filters a dispatch can ask for.
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      # os-image-tag pulls the node image from GHCR, and those packages are
+      # private. A job-level permissions block replaces the defaults, so
+      # without this the token cannot read them.
+      packages: read
+    env:
+      # nico-vms needs cgo for sqlite; without it the binary fails at the first query.
+      CGO_ENABLED: "1"
+      NICO_VMS_BRIDGE_NAME: controllerbr0
+      NICO_VMS_BRIDGE_CIDR: 172.30.0.0/24
+      # Required by nico-vms even on the iPXE path, which never boots it.
+      NICO_VMS_BASE_IMAGE: ${{ github.workspace }}/controller/nico-sim/images/ubuntu-cloud.qcow2
+      NICO_VMS_LIBVIRT_URI: qemu:///session
+      NICO_VMS_READINESS_TIMEOUT: 30m
+      # setup-ci-host.sh: UEFI firmware, swtpm, and the guests' metadata paths.
+      NKE_CI_HOST_FDE: "true"
+      CAPNICO_SOURCE_DIR: ${{ github.workspace }}/.capnico/cluster-api-provider-nico
+      KIND_CLUSTER_NAME: cwe-nico-vms
+      NKE_E2E_RUN_ID: github-nico-vms-${{ github.run_id }}-${{ github.run_attempt }}
+      # The host image builds pull their Docker Hub bases through this mirror,
+      # as the backend lanes do. See dockerhub_build_args in backend-e2e-lib.sh.
+      NKE_E2E_DOCKERHUB_MIRROR: mirror.gcr.io
+      # Per leg, from the matrix above: both run happy-path and multi-pod-cidrs,
+      # arm64 additionally runs parallel-lifecycle and ovn. A dispatch
+      # label-filter still overrides both. Its default has to stay empty:
+      # Actions substitutes a non-empty default whenever the input is omitted,
+      # so a dispatch would silently narrow the run and never reach the matrix.
+      NKE_E2E_LABEL_FILTER: ${{ github.event.inputs.label-filter || matrix.label_filter }}
+      # Empty on a schedule or a push, which is what makes the lane resolve the
+      # newest published image for each architecture. Only a dispatch pins one.
+      NKE_E2E_OS_IMAGE_TAG: ${{ github.event.inputs.os-image-tag }}
+      NKE_E2E_GINKGO_TIMEOUT: 270m
+      # One upgrade hop (1.35 -> 1.36), which recycles all three control-plane nodes, ~45 min.
+      NKE_E2E_UPGRADE_HOPS: "1"
+      # OVN-Kubernetes is this lane's default, so entries that do not pin a CNI
+      # run it. Calico coverage stays on the entries that pin it explicitly
+      # (OS profiles, parallel-lifecycle).
+      NKE_E2E_NICO_VMS_CNI: ovn-kubernetes
+      NKE_E2E_STATE_DIR: ${{ github.workspace }}/controller/.local/nico-vms-e2e/${{ github.run_id }}-${{ github.run_attempt }}
+      NKE_BRINGUP_ARTIFACT_DIR: ${{ github.workspace }}/controller/.local/nico-vms-e2e/${{ github.run_id }}-${{ github.run_attempt }}/host
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The node agent version comes from `git describe --match 'agent/v*'`.
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            **/go.sum
+
+      - name: Stage the pinned CAPNICo module
+        run: |
+          set -euo pipefail
+          source_dir="$(go mod download -json github.com/dsx-ai-factory/cluster-api-provider-nico | jq -er '.Dir')"
+          mkdir -p "${CAPNICO_SOURCE_DIR}"
+          cp -R "${source_dir}/." "${CAPNICO_SOURCE_DIR}/"
+          chmod -R u+w "${CAPNICO_SOURCE_DIR}"
+
+      - name: Read pinned tool versions
+        id: versions
+        run: |
+          {
+            echo "helm_version=$(make --no-print-directory print-HELM_VERSION)"
+            echo "kind_version=$(make --no-print-directory print-KIND_VERSION)"
+            echo "kubectl_version=$(make --no-print-directory print-KUBECTL_VERSION)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Only used when os-image-tag is set; installing it always keeps the
+      # step list the same either way.
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@5e2f2482b30b0cb3e14e67f89a80c88c659a7c63 # v2.0.3
+
+      # Same pair as os-image-artifact.yml, which pushes these packages.
+      # Unconditional, like the step above, so the step list does not change
+      # with the input.
+      - name: Sign in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GHCR_TOKEN}" | oras login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ steps.versions.outputs.helm_version }}
+
+      # The Tiltfile fetches the Postgres chart from Docker Hub over OCI. The
+      # shim local-entrypoint-e2e.yml installs rewrites that pull to the mirror.
+      - name: Route helm OCI pulls through the mirror
+        run: |
+          real="$(command -v helm)"
+          sudo mv "${real}" /usr/local/bin/helm-real
+          sudo install -m 0755 controller/hack/ci/helm-dockerhub-mirror.sh "${real}"
+          helm version --short
+
+      - name: Set up Kind and kubectl
+        uses: ./.github/actions/setup-kind
+        with:
+          kind_version: ${{ steps.versions.outputs.kind_version }}
+          kubectl_version: ${{ steps.versions.outputs.kubectl_version }}
+
+      - name: Install Tilt
+        run: |
+          set -euo pipefail
+          version="$(grep -oE 'TILT_VERSION:=v[0-9.]+' controller/hack/ci/backend-e2e.sh | head -1 | sed 's/.*:=v//')"
+          [[ -n "${version}" ]] || { echo "could not read the pinned Tilt version" >&2; exit 1; }
+          # Tilt names the 64-bit ARM asset arm64, not aarch64.
+          case "$(uname -m)" in
+            x86_64) tilt_arch=x86_64 ;;
+            aarch64) tilt_arch=arm64 ;;
+            *) echo "Tilt publishes no release asset for $(uname -m)" >&2; exit 1 ;;
+          esac
+          tmp="$(mktemp -d)"
+          # Retry: a CDN 504 must not fail the job on the first response.
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 240 \
+            -o "${tmp}/tilt.tgz" \
+            "https://github.com/tilt-dev/tilt/releases/download/v${version}/tilt.${version}.linux.${tilt_arch}.tar.gz"
+          tar -xzf "${tmp}/tilt.tgz" -C "${tmp}" tilt
+          sudo install -m 0755 "${tmp}/tilt" /usr/local/bin/tilt
+          tilt version
+
+      - name: Show runner tools
+        run: |
+          set -euo pipefail
+          nproc; free -g; df -h "${GITHUB_WORKSPACE}"
+          docker version --format 'docker {{.Server.Version}}'
+          docker buildx version
+          go version
+          helm version --short
+          kind version
+          kubectl version --client
+          if [[ -c /dev/kvm ]]; then
+            echo "::notice::/dev/kvm present; tenant nodes boot with hardware acceleration"
+          else
+            echo "::warning::/dev/kvm is missing on this runner; tenant nodes would run under software emulation"
+          fi
+
+      # Same two limits backend-e2e.yml raises; kind's containerd needs them.
+      - name: Configure runner inotify capacity
+        run: |
+          set -euo pipefail
+          raise_minimum() {
+            local key="$1" minimum="$2" current
+            current="$(sysctl -n "${key}")"
+            echo "${key}=${current} (required minimum ${minimum})"
+            if (( current < minimum )); then
+              sudo sysctl -w "${key}=${minimum}"
+              current="$(sysctl -n "${key}")"
+            fi
+            (( current >= minimum )) || { echo "${key} stayed below ${minimum}" >&2; exit 1; }
+          }
+          raise_minimum fs.inotify.max_user_instances 1024
+          raise_minimum fs.inotify.max_user_watches 1048576
+
+      - name: Prepare the runner host
+        run: ./controller/test/kubeadm/scripts/setup-ci-host.sh
+
+      - name: Run the nico-vms E2E suite
+        env:
+          # clusterctl reads provider manifests through the GitHub API; this
+          # runner's egress hits the anonymous rate limit.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./controller/hack/ci/nico-vms-e2e.sh
+
+      # Copies the VM console logs; must run before the upload.
+      - name: Tear down the runner host
+        if: always()
+        run: ./controller/test/kubeadm/scripts/teardown-ci-host.sh
+
+      - name: Check whether diagnostics are safe to upload
+        id: diagnostics
+        if: always()
+        run: |
+          if [[ -f "${NKE_E2E_STATE_DIR}/SAFE_TO_UPLOAD" ]]; then
+            echo "safe=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "safe=false" >> "${GITHUB_OUTPUT}"
+            echo "Diagnostics are absent or were not marked safe to upload."
+          fi
+
+      # Runner egress has answered FinalizeArtifact with 403; a lost upload must not fail a passing suite.
+      - name: Upload redacted diagnostics
+        if: always() && steps.diagnostics.outputs.safe == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # The architecture belongs in the name: both legs upload, and without
+          # it the two are one name and you cannot tell which leg you opened.
+          name: nico-vms-e2e-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.NKE_E2E_STATE_DIR }}/
+            !${{ env.NKE_E2E_STATE_DIR }}/cwe-e2e.test
+            # The smoke's own nvkectl state: a cached controller token lives here.
+            !${{ env.NKE_E2E_STATE_DIR }}/nvkectl-home
+            !${{ env.NKE_E2E_STATE_DIR }}/nvkectl-no-auth
+            !${{ env.NKE_E2E_STATE_DIR }}/nvkectl
+            !${{ env.NKE_E2E_STATE_DIR }}/kubeconfig
+            # The node image pulled from GHCR (nico-vms-e2e.sh:442): an input,
+            # not a diagnostic, and 3.1 GB of a 3.1 GB artifact.
+            !${{ env.NKE_E2E_STATE_DIR }}/os-image/*.qcow2
+          if-no-files-found: warn
+          retention-days: 7

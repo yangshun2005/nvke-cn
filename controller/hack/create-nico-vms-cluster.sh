@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Create a sample NVKE cluster on the local nico-vms backend (real KVM/libvirt VMs).
+#
+# Defaults to 1 control-plane node + 1 worker node, using the nico-vms seed
+# resources (see nico-vms/internal/seed/default-seed.yaml) and native VPC-prefix
+# networking. Every value is overridable via the environment variables below.
+#
+# Notes:
+#   - Defaults to cpu4-mem8gb for control-plane nodes and cpu4-mem6gb for workers.
+#     The controller's generated kubeadm patch reserves 2Gi for Kubernetes plus the
+#     systemReservedMemory below. OVN's node pod requests another 1800Mi, so 6Gi is
+#     sufficient for workers but not for control-plane nodes after kernel reservations
+#     and control-plane pod requests.
+#   - systemReservedMemory defaults to 1Gi. The controller API/DB default is 16Gi, which alone
+#     exceeds these small seed instance types, so it must be set explicitly here.
+#   - The control plane is cluster-level controlPlaneConfig, not a node pool.
+#     The controller rejects control-plane node pools when control-plane controller
+#     provisioning is enabled, which is the default.
+#   - The worker pool is always included; set WORKER_DESIRED_COUNT=0 to create a
+#     control-plane-only cluster.
+#   - CNI defaults to ovn-kubernetes. Set CNI_PLUGIN=calico to use Calico instead
+#     (Linux only: on macOS the script needs a custom POD_CIDR, which the controller
+#     accepts only with ovn-kubernetes, so calico fails fast there).
+#     CNI_VERSION is optional; when empty the controller API applies the plugin default
+#     (2.4.2 for OVN, 3.30.1 for Calico).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The helper path is resolved from this script, independent of the caller's working directory.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/control-plane-vip.sh"
+
+NVKE_CONTROLLER_HTTP_PORT="${NVKE_CONTROLLER_HTTP_PORT:-8080}"
+API_URL="${API_URL:-http://localhost:${NVKE_CONTROLLER_HTTP_PORT}/api}"
+CLUSTERS_API_URL="${API_URL%/}/clusters"
+
+# /api/* is authenticated. hack/nvke-token.sh prints nothing when NVKE is not, so
+# this works either way.
+TOKEN="$("${SCRIPT_DIR}/nvke-token.sh")"
+AUTH_HEADER=()
+if [[ -n "${TOKEN}" ]]; then
+  AUTH_HEADER=(-H "Authorization: Bearer ${TOKEN}")
+fi
+
+CLUSTER_NAME="${CLUSTER_NAME:-nico-vms}"
+
+# nico-vms seed resources (default-seed.yaml).
+ORG_ID="${ORG_ID:-novxwn552ssc}"
+SITE_ID="${SITE_ID:-a1b2c3d4-0001-4000-8000-000000000001}"
+VPC_ID="${VPC_ID:-a1b2c3d4-0002-4000-8000-000000000001}"
+VPC_PREFIX_ID="${VPC_PREFIX_ID:-a1b2c3d4-0004-4000-8000-000000000001}"
+CONTROL_PLANE_INSTANCE_TYPE_ID="${CONTROL_PLANE_INSTANCE_TYPE_ID:-a1b2c3d4-0005-4000-8000-000000000006}"  # cpu4-mem8gb-disk60gb
+# The arm64 generic kernel on darwin-qemu reserves 512Mi for crashkernel, which
+# leaves a 6Gi node too little allocatable for ovnkube-node's 1800Mi request.
+if [[ "$(uname -s)" == Darwin ]]; then
+  WORKER_INSTANCE_TYPE_ID="${WORKER_INSTANCE_TYPE_ID:-a1b2c3d4-0005-4000-8000-000000000006}"  # cpu4-mem8gb-disk60gb
+else
+  WORKER_INSTANCE_TYPE_ID="${WORKER_INSTANCE_TYPE_ID:-a1b2c3d4-0005-4000-8000-000000000003}"  # cpu4-mem6gb-disk60gb
+fi
+
+KUBERNETES_VERSION="${KUBERNETES_VERSION:-1.36.3}"
+CONTROL_PLANE_DESIRED_COUNT="${CONTROL_PLANE_DESIRED_COUNT:-1}"
+WORKER_DESIRED_COUNT="${WORKER_DESIRED_COUNT:-1}"
+CONTROL_PLANE_VIP="${CONTROL_PLANE_VIP:-}"
+DEFAULT_VIP_RANGE="${DEFAULT_VIP_RANGE:-172.31.0.0/24}"
+FIRST_CONTROL_PLANE_VIP="${FIRST_CONTROL_PLANE_VIP:-172.31.0.10}"
+# POD_CIDR empty keeps the API default (192.168.0.0/16), which overlaps the
+# vmnet node network on darwin, so pick one outside it there.
+if [[ "$(uname -s)" == Darwin ]]; then
+  POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
+else
+  POD_CIDR="${POD_CIDR:-}"
+fi
+CNI_PLUGIN="${CNI_PLUGIN:-ovn-kubernetes}"
+CNI_VERSION="${CNI_VERSION:-}"
+# The controller accepts a custom podCIDR only with OVN-Kubernetes, and macOS
+# needs one, so Calico cannot be created there.
+if [[ "$(uname -s)" == Darwin && "${CNI_PLUGIN}" == calico ]]; then
+  echo "CNI_PLUGIN=calico is not supported on macOS: the vmnet node network overlaps Calico's default pod CIDR and the controller only accepts a custom pod CIDR with ovn-kubernetes. Use CNI_PLUGIN=ovn-kubernetes." >&2
+  exit 1
+fi
+
+case "$(uname -m)" in
+  x86_64) PROFILE_ARCH=amd64 ;;
+  aarch64 | arm64) PROFILE_ARCH=arm64 ;;
+  *)
+    echo "Unsupported host architecture for nico-vms: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+if [[ "${NICO_VMS_STAGE_OS_IMAGE:-true}" == "true" ]]; then
+  if [[ -n "${NICO_VMS_OS_IMAGE_URL:-}" ]]; then
+    "${SCRIPT_DIR}/stage-nico-vms-image.sh"
+  else
+    files_dir="${NICO_SIM_FILES_DIR:-${SCRIPT_DIR}/../nico-sim/.dev/files}"
+    image_path="${files_dir}/images/nvke-node.qcow2"
+    if [[ ! -s "${image_path}" ]]; then
+      echo "No nico-vms OS image exists in nico-sim files at ${image_path}." >&2
+      echo "Use the nico-sim Stage OS image button or provide NICO_VMS_OS_IMAGE_URL." >&2
+      exit 1
+    fi
+    echo "Using the nico-sim OS image at ${image_path}." >&2
+  fi
+fi
+RELEASE="${RELEASE:-nvke-nico-vms-24.04-${PROFILE_ARCH}-fde}"
+CP_CONFIG_PROFILE="${CP_CONFIG_PROFILE:-nico-vms-cp}"
+WORKER_CONFIG_PROFILE="${WORKER_CONFIG_PROFILE:-nico-vms-worker}"
+SYSTEM_RESERVED_MEMORY="${SYSTEM_RESERVED_MEMORY:-1Gi}"
+ETCD_ENCRYPTED="${ETCD_ENCRYPTED:-false}"
+
+CNI_VERSION_JSON=""
+if [[ -n "${CNI_VERSION}" ]]; then
+  CNI_VERSION_JSON=",
+  \"cniVersion\": \"${CNI_VERSION}\""
+fi
+
+NETWORK_JSON=""
+if [[ -n "${POD_CIDR}" ]]; then
+  NETWORK_JSON=",
+  \"network\": {\"podCIDR\": \"${POD_CIDR}\"}"
+fi
+
+if [[ -z "${CONTROL_PLANE_VIP}" ]]; then
+  CLUSTERS="$(curl "${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"}" -fsS --max-time "${CURL_MAX_TIME:-30}" "${CLUSTERS_API_URL}")"
+  CONTROL_PLANE_VIP="$(
+    first_available_control_plane_vip "${DEFAULT_VIP_RANGE}" "${CLUSTERS}" "${FIRST_CONTROL_PLANE_VIP}"
+  )"
+fi
+
+BODY=$(cat <<EOF
+{
+  "name": "${CLUSTER_NAME}",
+  "nico": {
+    "orgID": "${ORG_ID}",
+    "siteID": "${SITE_ID}",
+    "vpcID": "${VPC_ID}"
+  },
+  "controlPlaneKubernetesVersion": "${KUBERNETES_VERSION}",
+  "controlPlaneVIP": "${CONTROL_PLANE_VIP}",
+  "cniPlugin": "${CNI_PLUGIN}"${CNI_VERSION_JSON}${NETWORK_JSON},
+  "etcdEncrypted": ${ETCD_ENCRYPTED},
+  "teleportEnabled": false,
+  "controlPlaneConfig": {
+    "desiredCount": ${CONTROL_PLANE_DESIRED_COUNT},
+    "systemReservedMemory": "${SYSTEM_RESERVED_MEMORY}",
+    "teleportEnabled": false,
+    "nico": {
+      "instanceTypePreference": ["${CONTROL_PLANE_INSTANCE_TYPE_ID}"],
+      "vpcPrefixIDs": ["${VPC_PREFIX_ID}"],
+      "release": "${RELEASE}",
+      "configProfile": "${CP_CONFIG_PROFILE}"
+    }
+  },
+  "nodePools": [
+    {
+      "name": "worker",
+      "nodeNamePrefix": "w",
+      "nico": {
+        "vpcPrefixIDs": ["${VPC_PREFIX_ID}"],
+        "instanceTypeID": "${WORKER_INSTANCE_TYPE_ID}",
+        "release": "${RELEASE}",
+        "configProfile": "${WORKER_CONFIG_PROFILE}"
+      },
+      "systemReservedMemory": "${SYSTEM_RESERVED_MEMORY}",
+      "controlPlane": false,
+      "desiredNodeCount": ${WORKER_DESIRED_COUNT},
+      "autoProvisionDisabled": false,
+      "autoModeDisabled": false,
+      "recycleBudget": 0,
+      "teleportEnabled": false
+    }
+  ]
+}
+EOF
+)
+
+echo "Creating nico-vms cluster '${CLUSTER_NAME}' (cp=${CONTROL_PLANE_DESIRED_COUNT}, worker=${WORKER_DESIRED_COUNT}, cni=${CNI_PLUGIN}${CNI_VERSION:+/${CNI_VERSION}}, controlPlaneVIP=${CONTROL_PLANE_VIP})" >&2
+
+# curl without --fail exits 0 on HTTP 400 and 401, and --fail hides the body.
+# Keep the body visible, then fail the script from the status.
+create_response="$(
+  curl "${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"}" -sS --max-time "${CURL_MAX_TIME:-30}" \
+    -w '\n%{http_code}' \
+    "${CLUSTERS_API_URL}" \
+    -H "Content-Type: application/json" \
+    --data-raw "${BODY}"
+)"
+create_status="${create_response##*$'\n'}"
+create_body="${create_response%$'\n'*}"
+if ! printf '%s\n' "${create_body}" | jq; then
+  printf '%s\n' "${create_body}"
+fi
+if [[ ! "${create_status}" =~ ^2[0-9][0-9]$ ]]; then
+  echo "create-nico-vms-cluster: create failed with HTTP ${create_status}" >&2
+  exit 1
+fi

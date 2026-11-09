@@ -1,0 +1,190 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# CodeQL static analysis. Results go to Security -> Code scanning.
+#
+# Three languages, one job per language via a matrix: go, javascript-typescript
+# and actions. Only go needs a traced build; the other two extract from source.
+#
+# `build-mode: manual` because CodeQL has to observe a real compile to build its
+# database. Whatever the build step compiles is what gets analysed, and nothing
+# else -- so the scope of this workflow is set by that one command.
+#
+# It used to compile agent/ alone, because controller/ required the carbide SDK
+# and could not build on a public runner. #76 replaced that SDK with the public
+# ncx-infra-controller-rest, so the whole workspace builds from public
+# dependencies now, and the build step is `make build` -- which compiles every
+# package in all ten modules.
+#
+# One database rather than a matrix, deliberately. CodeQL produces a single
+# database per run and uploads it under one category, so a matrix would need a
+# category per module and would analyse shared code once per module that imports
+# it. A single traced build covers the same code once.
+#
+# The workspace stays ON, where this file previously set GOWORK=off. That is
+# what makes the build reproducible: go.sum pins the public modules, which are
+# downloaded into the Go cache as needed. It is also why go-version is pinned
+# rather than read from a go.mod -- see the comment on that step.
+
+name: CodeQL
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+      # Dependabot branches are mirrored to neither main nor
+      # pull-request/N, so without this line a dependency bump gets none
+      # of this check -- and a check that cannot report on a pull request
+      # cannot be required. Same list as notices-check.yml.
+      - "dependabot/**"
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started. Five merges in
+  # three minutes cancelled 18 runs across 7 workflows this way, leaving
+  # three consecutive commits on main with no test result at all.
+  #
+  # Pull-request branches keep sharing a group and still cancel, which is
+  # what you want there.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so any workflow merge-gate.yml calls would
+  # share a group with its siblings and cancel them. 8 of 9 calls died that way,
+  # reported as failures with no jobs and no error message.
+  group: CodeQL-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: linux-amd64-cpu16
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    # A matrix over LANGUAGES, which is not the matrix the note at the top of
+    # this file argues against -- that one is about modules, and the Go build
+    # below still analyses all ten in a single traced pass. CodeQL produces
+    # one database per language and uploads each under its own category, so a
+    # language axis is the shape it expects.
+    #
+    # Only Go needs a build. javascript-typescript and actions are extracted
+    # from source, so they take build-mode: none and skip the Go setup below.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: manual
+          # controller/ui ships into the image at /ui (controller/Dockerfile:76),
+          # so this is analysed code, not developer tooling.
+          - language: javascript-typescript
+            build-mode: none
+          # The workflows themselves. One of them runs on pull_request_target.
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Read the pin from make/versions.mk rather than repeating it here. It was
+      # written in this file and in codeql.yml and nowhere a developer could
+      # reach it, so `make govulncheck` locally could not match this job.
+      - name: Read pinned Go version
+        id: versions
+        run: echo "go=$(make --no-print-directory print-GOVULNCHECK_GO_VERSION)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: matrix.language == 'go'
+        with:
+          # Pin the version the Dockerfiles build with. Not go-version-file: a
+          # go directive is a floor, so it installs the oldest Go a module
+          # allows -- and these eight floors range from 1.25.4 to 1.26.5, while
+          # go.work asks for 1.26.5. setup-go pins GOTOOLCHAIN=local, so reading
+          # agent/go.mod (1.26.0) would fail outright against the workspace:
+          #
+          #   go: go.work requires go >= 1.26.5
+          #       (running go 1.26.0; GOTOOLCHAIN=local)
+          #
+          # Not `stable` either: setup-go resolves it from GitHub's manifest,
+          # which lags upstream Go. Keep this in step with the Dockerfiles.
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+          # go.work.sum holds only the hashes NOT already in a member's go.sum,
+          # so the versions actually linked often appear in it zero times. Keyed
+          # on it alone, a dependency bump leaves the key unchanged and restores
+          # a stale cache. Same block as go-build.yml.
+          cache-dependency-path: |
+            go.work.sum
+            **/go.sum
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # security-extended over the default suite. The default set is tuned
+          # to keep false positives low; this repository would rather see a
+          # noisier list than miss something, and CodeQL reports into the
+          # Security tab without failing the build, so a wider net costs
+          # triage time rather than merges.
+          queries: security-extended
+
+      - name: Build
+        if: matrix.language == 'go'
+        # Not `make build`, and not `go build -C <module>`, though both compile
+        # exactly the right set. CodeQL traces the `go` process it puts on PATH,
+        # and `-C` makes go chdir before it does anything else, so the extractor
+        # attributes nothing to the source root. The first attempt at this
+        # workflow used `make build` -- which is a `go build -C` loop -- and the
+        # analysis failed with:
+        #
+        #   CodeQL detected code written in Go but this run didn't build any of
+        #   it, or CodeQL could not process any of it.
+        #
+        # even though every module compiled and all five binaries were linked.
+        # A green build step is not evidence CodeQL saw it.
+        #
+        # `cd` into each module instead, which is the shape that worked when
+        # this file built agent/ alone with working-directory.
+        #
+        # The module list still comes from go.work rather than being kept here,
+        # so a module added to the workspace is analysed with no change to this
+        # file.
+        #
+        shell: bash
+        run: |
+          set -euo pipefail
+          mods=$(sed -n '/^use (/,/^)/p' go.work \
+            | sed -n 's#^[[:space:]]*\./##p' \
+            | sed 's/[[:space:]]*$//' \
+            | grep -v '^$')
+
+          if [ -z "$mods" ]; then
+            echo "::error::no modules found in go.work; the use() block did not parse"
+            exit 1
+          fi
+
+          root=$PWD
+          while IFS= read -r m; do
+            echo "::group::go build ./... in $m"
+            (cd "${root}/${m}" && go build ./...)
+            echo "::endgroup::"
+          done <<< "$mods"
+
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: "/language:${{ matrix.language }}"

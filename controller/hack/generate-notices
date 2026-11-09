@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+#
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Generates THIRD_PARTY_NOTICES.md: every third-party Go module linked into the
+# released cloud-workflow-engine worker binary and, for the controller's file, the
+# cluster-api-provider-provisioned manager binary, with the verbatim text of each
+# module's license.
+#
+# Adapted from NVIDIA/aicr's tools/generate-notices, which produces the same
+# shape of file (module index table, then verbatim license texts) and the same
+# notices / notices-check make target pair.
+#
+# WHY THE TARGET PLATFORM IS PINNED
+#
+#   go-licenses — like `go list` and golang.org/x/tools/go/packages beneath it —
+#   resolves the dependency graph for a SINGLE platform: the host's GOOS/GOARCH
+#   unless told otherwise. For the controller the *module* set turns out to be identical
+#   across linux/amd64, linux/arm64 and darwin/arm64 (verified against
+#   `go list -deps`), so the choice does not affect which dependencies are
+#   attributed.
+#
+#   It does affect the reported package path. go-licenses names the package it
+#   resolved a license from, and build tags move that: linux/amd64 reports
+#   `golang.org/x/sys` where linux/arm64 and darwin/arm64 report
+#   `golang.org/x/sys/unix`. Same module, same license, different bytes on the
+#   page. Left to the host, a macOS developer and a Linux CI runner would
+#   generate files that differ by a line, and notices-check would fail for
+#   whoever regenerated it last.
+#
+#   Pinning the platform makes the output identical everywhere. linux/amd64 is
+#   the primary architecture of the published container image.
+#
+#   AICR loops over four platforms instead, because it releases a darwin CLI as
+#   well as linux daemons (see its .goreleaser.yaml), so for that project the
+#   dependency set itself genuinely varies by GOOS. The controller ships one linux
+#   container, so a single pinned target is sufficient.
+#
+# Requires: go, go-licenses (installed by the Makefile's notices target).
+
+set -euo pipefail
+
+MODULE_ROOT="${MODULE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+
+cd "${MODULE_ROOT}"
+
+OUTPUT="${OUTPUT:-${MODULE_ROOT}/THIRD_PARTY_NOTICES.md}"
+
+# The binaries shipped in the container images: the CWE worker, and the
+# cluster-api-provider-provisioned manager, whose image ships this same file.
+# nico-sim and nico-simctl are development tooling and are not distributed.
+# PACKAGES entries are relative to this module.
+read -r -a PACKAGES <<< "${PACKAGES:-./cmd/worker ../cluster-api-provider-provisioned/cmd/manager}"
+
+# What the header says the file covers. cli and os-image share this script and
+# keep the original text; only a file that also covers the provider manager names it.
+SCOPE=$'the released\n`cloud-workflow-engine` worker binary'
+case " ${PACKAGES[*]} " in
+    *cluster-api-provider-provisioned/cmd/manager*)
+        SCOPE=$'the released\n`cloud-workflow-engine` worker binary and the\n`cluster-api-provider-provisioned` manager binary' ;;
+esac
+
+# Pinned, not inherited from the host — see the header. Matches the primary
+# architecture of the published image; the Dockerfile builds GOOS=linux.
+export GOOS=linux
+export GOARCH=amd64
+# The released binary is built with CGO_ENABLED=0 (see Dockerfile). Setting it
+# here lets go-licenses analyse the target platform without a C toolchain.
+export CGO_ENABLED=0
+
+GO_LICENSES="${GO_LICENSES:-$(go env GOPATH)/bin/go-licenses}"
+if [[ ! -x "${GO_LICENSES}" ]]; then
+    if command -v go-licenses >/dev/null 2>&1; then
+        GO_LICENSES="$(command -v go-licenses)"
+    else
+        echo "ERROR: go-licenses not found." >&2
+        echo "Run 'make go-licenses' first." >&2
+        exit 1
+    fi
+fi
+
+# GOWORK=off is required, not tidiness. This repository is a Go workspace, and
+# under it `go list -m` prints all eight member modules rather than one, so
+# LOCAL_MODULE becomes a multi-line string and the --ignore value built from it
+# below stops meaning anything. Turning the workspace off narrows it to this
+# module, which is what the variable name promises.
+# Ask with the workspace disabled so exactly one module path is returned.
+LOCAL_MODULE="$(cd "${MODULE_ROOT}" && GOWORK=off go list -m 2>/dev/null || true)"
+if [[ -z "${LOCAL_MODULE}" ]]; then
+    echo "ERROR: could not determine the local module path via 'go list -m'." >&2
+    exit 1
+fi
+if [[ "${LOCAL_MODULE}" == *$'\n'* ]]; then
+    echo "ERROR: 'go list -m' returned more than one module:" >&2
+    printf '  %s\n' "${LOCAL_MODULE}" >&2
+    echo "Expected exactly one. Check GOWORK." >&2
+    exit 1
+fi
+
+# First-party NVIDIA modules are not third-party dependencies. The main module
+# is excluded by path; the siblings are named explicitly below because they are
+# our own code and carry no LICENSE file of their own.
+#
+# They are named rather than matched by a `gitlab-master.nvidia.com` prefix,
+# which is what this used to do. No module in this repository has had a
+# gitlab-master path since the public-dependency migration, so that prefix
+# matched nothing and the siblings were never actually ignored.
+#
+# Nothing else is ignored. Every other dependency is attributed, including the
+# whole golang.org/*, google.golang.org/*, gopkg.in/*, go.uber.org/*,
+# go.opentelemetry.io/* and go.temporal.io/* families.
+#
+# That is worth stating because the obvious-looking addition here is a stdlib
+# ignore list, and adding one silently drops exactly those families. --ignore
+# matches by string prefix, not path component, so the entry "go" — which
+# `go list std | cut -d/ -f1` produces, from go/ast and go/build — swallows
+# every module whose path merely begins with those two letters. It cost 29 of
+# the controller's 140 dependencies here, with no error and no warning.
+#
+# No stdlib list is needed anyway: go-licenses already excludes the standard
+# library, verified by it emitting zero packages whose first path component
+# lacks a dot.
+IGNORE="${LOCAL_MODULE},github.com/dsx-ai-factory/nvke/agent,github.com/dsx-ai-factory/nvke/auth,github.com/dsx-ai-factory/nvke/controller/api,github.com/dsx-ai-factory/nvke/controller/deploy/charts,github.com/dsx-ai-factory/nvke/management-engine,github.com/dsx-ai-factory/nvke/cluster-api-provider-provisioned,github.com/dsx-ai-factory/cluster-api-provider-nico"
+
+# Explicit mktemp templates: macOS mktemp with no template ignores TMPDIR and
+# allocates under confstr(_CS_DARWIN_USER_TEMP_DIR), which makes the scratch
+# location unoverridable in sandboxed environments.
+LICENSES_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cwe-notices.XXXXXX")"
+INDEX_FILE="$(mktemp "${TMPDIR:-/tmp}/cwe-notices-idx.XXXXXX")"
+MODMAP_FILE="$(mktemp "${TMPDIR:-/tmp}/cwe-notices-mod.XXXXXX")"
+trap 'rm -rf "${LICENSES_DIR}"; rm -f "${INDEX_FILE}" "${MODMAP_FILE}" "${DRAFT_FILE:-}"' EXIT
+
+echo "Collecting licenses for ${GOOS}/${GOARCH}..." >&2
+
+# go-licenses save writes each dependency's license to
+# <save_path>/<import-path>/<filename>. Deliberately no ignore list beyond the
+# first-party modules above: the notices file MUST cover every redistributed
+# dependency, including copyleft ones that a license *policy* check would treat
+# separately.
+"${GO_LICENSES}" save "${PACKAGES[@]}" \
+    --save_path="${LICENSES_DIR}" \
+    --force \
+    --ignore="${IGNORE}"
+
+echo "Generating dependency index..." >&2
+
+# module -> module@version, so the index records the exact version whose license
+# text is reproduced below; a package path alone does not say which version was
+# linked. Keyed by module rather than by import path because go-licenses names
+# the directory it found the LICENSE in, which is often the module root and not
+# itself an imported package: golang.org/x/sys is reported while only
+# golang.org/x/sys/unix is imported. Resolution below is therefore by longest
+# matching module prefix, not exact match.
+#
+# A replace directive is honoured, and reported as the replacement rather than
+# the original: it is the replacement that is compiled in and whose license text
+# is reproduced, so naming the original would attribute a version the binary
+# does not contain. The controller pins sigs.k8s.io/controller-runtime back to v0.22.5 that
+# way, where .Module.Version still reads v0.23.3. The key stays .Module.Path
+# because package import paths are unaffected by the replacement.
+go list -deps -buildvcs=false \
+    -f '{{if .Module}}{{.Module.Path}} {{with .Module.Replace}}{{.Path}}{{if .Version}}@{{.Version}}{{end}}{{else}}{{.Module.Path}}@{{.Module.Version}}{{end}}{{end}}' \
+    "${PACKAGES[@]}" 2>/dev/null | LC_ALL=C sort -u > "${MODMAP_FILE}"
+
+# Collapse to one row per package, emitting TAB-separated pkg/license/url.
+# LC_ALL=C pins byte ordering so macOS (BSD sort) and Linux (GNU sort) agree —
+# locale collation orders mixed-case module paths differently (Azure before
+# alecthomas in C, after it in en_US.UTF-8), which is the classic source of
+# cross-platform diff noise in a file that CI regenerates and diffs.
+#
+# Every distinct license for a package is joined rather than keeping whichever
+# row sorted first: a dual-licensed dependency must not be reduced to half its
+# terms.
+"${GO_LICENSES}" csv "${PACKAGES[@]}" --ignore="${IGNORE}" \
+    | LC_ALL=C sort -u \
+    | awk -F, 'NF>=3 {
+        pkg=$1; url=$2; lic=$3
+        if (!(pkg in link)) { order[++n]=pkg; link[pkg]=url }
+        if (index(seen[pkg], "\x1f" lic "\x1f") == 0) {
+            seen[pkg] = seen[pkg] "\x1f" lic "\x1f"
+            lics[pkg] = (lics[pkg] == "" ? lic : lics[pkg] " / " lic)
+        }
+      }
+      END { for (i = 1; i <= n; i++) { p = order[i]; printf "%s\t%s\t%s\n", p, lics[p], link[p] } }' \
+    > "${INDEX_FILE}"
+
+# Attach module@version to each row by longest matching module prefix. Before
+# the URL steps below, which compare the version against the committed file.
+awk -F'\t' '
+    NR == FNR { split($0, a, " "); mp[a[1]] = a[2]; next }
+    {
+        best = ""
+        for (m in mp) {
+            if (($1 == m || index($1, m "/") == 1) && length(m) > length(best)) {
+                best = m
+            }
+        }
+        printf "%s\t%s\t%s\t%s\n", $1, $2, $3, (best == "" ? "unknown" : mp[best])
+    }' "${MODMAP_FILE}" "${INDEX_FILE}" > "${INDEX_FILE}.mod"
+mv "${INDEX_FILE}.mod" "${INDEX_FILE}"
+
+# Settle the licence URL from the committed file, not the network.
+#
+# For a module in a repository subdirectory with a major version suffix --
+# go.etcd.io/etcd/client/v3, tagged client/v3.7.1 -- the directory may be
+# client/v3 or client, and etcd has both kinds: api/v3 lives in api/. The tag
+# cannot say which. go-licenses decides with a HEAD request for <dir>/vN/go.mod
+# on github.com and, in its own words, "on any failure, assume that the right
+# directory is the one without the version" (pkgsite's
+# source.adjustVersionedModuleDirectory). GitHub-hosted runners are throttled
+# often enough that the URL flips between runs, and notices-check cannot tell
+# a flip from a change, since it compares the file against a regeneration of
+# itself.
+#
+# So when the committed file already has a URL for the package that differs
+# from the regenerated one only by that /vN segment, the committed URL stands:
+# a human verified it once, and the probe has no information the file lacks.
+# The same holds when the probe finds nothing and go-licenses writes "Unknown":
+# gopkg.in answers its go-get requests with a 502 now and then, and a URL the
+# file already has for the same module version stands over a blank.
+# Anything else -- a new package, a new version, a different licence file --
+# still shows up as a diff, and a new package keeps whatever go-licenses chose,
+# to be verified when it is first committed. The root-module repair below runs
+# after this step on purpose: a committed URL may carry the spurious /vN segment
+# from before that repair existed, and the rule, not the file, decides for roots.
+if [[ -f "${OUTPUT}" ]]; then
+    awk -F'\t' 'BEGIN { OFS = "\t" }
+        # First file: the committed index rows, "| `pkg` | licence | `module` | url |".
+        FNR == NR {
+            if ($0 ~ /^\| `[^`]+` \| .* \| `[^`]*` \| [^ |]+ \|$/) {
+                pkg = $0; sub(/^\| `/, "", pkg); sub(/`.*$/, "", pkg)
+                url = $0; sub(/ \|$/, "", url); sub(/^.* \| /, "", url)
+                mod = $0; sub(/ \| [^ |]+ \|$/, "", mod); sub(/^.* \| `/, "", mod); sub(/`$/, "", mod)
+                committed[pkg] = url; cmod[pkg] = mod
+            }
+            next
+        }
+        # Second file: the regenerated pkg/licence/url index.
+        {
+            if (($1 in committed) && committed[$1] != $3) {
+                a = $3; b = committed[$1]
+                # Drop the first /vN/ segment from each; equal means they differ
+                # only in that segment. The tag "client/v3.7.1" does not match:
+                # a dot follows its digits, not a slash.
+                a2 = a; sub(/\/v[0-9]+\//, "/", a2)
+                b2 = b; sub(/\/v[0-9]+\//, "/", b2)
+                if (a2 == b || b2 == a) { $3 = b }
+                else if (a == "Unknown" && cmod[$1] == $4) { $3 = b }
+            }
+            print
+        }' "${OUTPUT}" "${INDEX_FILE}" > "${INDEX_FILE}.settled"
+    SETTLED_N=$(diff <(cut -f3 "${INDEX_FILE}") <(cut -f3 "${INDEX_FILE}.settled") | grep -c '^>' || true)
+    if [[ "${SETTLED_N}" -gt 0 ]]; then
+        echo "Kept ${SETTLED_N} committed licence URL(s) over go-licenses' network-dependent choice." >&2
+    fi
+    mv "${INDEX_FILE}.settled" "${INDEX_FILE}"
+fi
+
+# Repair the licence URL of a major-version module at the repository root.
+#
+# For a module whose path ends in /vN, go-licenses may treat that suffix as a
+# directory inside the repository and write it into the URL:
+#
+#   https://github.com/blang/semver/blob/v4.0.0/v4/LICENSE      404
+#   https://github.com/blang/semver/blob/v4.0.0/LICENSE         200
+#
+# The tag decides, without guessing. Go requires a module in a subdirectory to
+# be tagged <subdir>/vX.Y.Z, so a plain vX.Y.Z tag means the module sits at the
+# repository root, and a root module cannot have a directory prefix on its
+# licence path. When the tag carries no slash and the next segment is exactly
+# this module's major-version suffix, that segment is spurious. A module that
+# really lives in a vN/ subdirectory is tagged vN/vX.Y.Z and does not match;
+# neither do pseudo-versions or commit refs. Same rule as agent/hack/generate-notices.sh.
+awk -F'\t' 'BEGIN { OFS = "\t" }
+    {
+        url = $3
+        # https://<host>/<owner>/<repo>/blob/<ref>/<path>
+        if (match(url, /\/blob\/[^\/]+\//)) {
+            ref  = substr(url, RSTART + 6, RLENGTH - 7)
+            rest = substr(url, RSTART + RLENGTH)
+            if (ref ~ /^v[0-9]+\.[0-9]+\.[0-9]+/ && rest ~ /^v[0-9]+\//) {
+                major = substr(rest, 1, index(rest, "/") - 1)
+                if ($1 ~ ("/" major "$") || $1 ~ ("/" major "/")) {
+                    $3 = substr(url, 1, RSTART + RLENGTH - 1) substr(rest, length(major) + 2)
+                }
+            }
+        }
+        print
+    }' "${INDEX_FILE}" > "${INDEX_FILE}.repaired"
+REPAIRS=$(diff <(cut -f3 "${INDEX_FILE}") <(cut -f3 "${INDEX_FILE}.repaired") | grep -c '^>' || true)
+if [[ "${REPAIRS}" -gt 0 ]]; then
+    echo "Repaired ${REPAIRS} major-version licence URL(s) of root modules." >&2
+fi
+mv "${INDEX_FILE}.repaired" "${INDEX_FILE}"
+
+if [[ ! -s "${INDEX_FILE}" ]]; then
+    echo "ERROR: go-licenses produced no entries — refusing to write an empty notices file." >&2
+    exit 1
+fi
+
+# Emit a code fence long enough to contain a license file verbatim. Some
+# licenses are Markdown and contain fenced blocks of their own; a fixed ```
+# fence is closed early by that content, after which the rest of the license
+# renders as Markdown and every following block is inverted. CommonMark allows a
+# longer opening fence, so use one backtick more than the longest run present.
+fence_for() {
+    local file="$1" longest width
+    longest="$(grep -oE '`+' "${file}" 2>/dev/null \
+        | awk '{ if (length($0) > m) m = length($0) } END { print m+0 }')"
+    width=$(( longest + 1 ))
+    if (( width < 3 )); then
+        width=3
+    fi
+    printf '%*s' "${width}" '' | tr ' ' '`'
+}
+
+echo "Composing ${OUTPUT}..." >&2
+# Composed into a temp file and moved into place only on success. The body below
+# aborts if a package has no saved license text, and a direct redirect would
+# leave a truncated notices file behind on that path.
+DRAFT_FILE="$(mktemp "${TMPDIR:-/tmp}/cwe-notices-out.XXXXXX")"
+{
+    cat <<'EOF'
+# Third-Party Notices
+
+NVIDIA Cloud Workflow Engine (CWE)
+
+EOF
+    printf 'This file lists every third-party Go module statically linked into %s, along with the verbatim text of each\nmodule'\''s license.\n' "${SCOPE}"
+    cat <<'EOF'
+
+Standard library packages are excluded — their license is covered by the Go
+distribution. First-party NVIDIA modules are excluded as they are not
+third-party dependencies.
+
+This file is generated. Run `make notices` to regenerate it; `make
+notices-check` verifies it is up to date.
+
+## Go Module Index
+
+| Package | License | Module | Source |
+|---------|---------|--------|--------|
+EOF
+
+    while IFS=$'\t' read -r pkg license url mod; do
+        [[ -z "${pkg}" ]] && continue
+        # shellcheck disable=SC2016  # backticks are literal markdown, not command substitution.
+        printf '| `%s` | %s | `%s` | %s |\n' \
+            "${pkg}" "${license:-Unknown}" "${mod:-unknown}" "${url:-n/a}"
+    done < "${INDEX_FILE}"
+
+    cat <<'EOF'
+
+## Go Module License Texts
+
+EOF
+
+    while IFS=$'\t' read -r pkg license url mod; do
+        [[ -z "${pkg}" ]] && continue
+        printf '### %s\n\n' "${pkg}"
+        printf '_%s — %s_\n\n' "${license:-Unknown}" "${mod:-unknown}"
+
+        if [[ -d "${LICENSES_DIR}/${pkg}" ]]; then
+            # LC_ALL=C sort keeps multi-file license directories (LICENSE plus
+            # NOTICE, say) in a stable order.
+            while IFS= read -r -d '' lf; do
+                fence="$(fence_for "${lf}")"
+                printf '#### %s\n\n' "$(basename "${lf}")"
+                printf '%stext\n' "${fence}"
+                cat "${lf}"
+                echo
+                printf '%s\n' "${fence}"
+                echo
+            done < <(find "${LICENSES_DIR}/${pkg}" -maxdepth 1 -type f -print0 2>/dev/null \
+                | LC_ALL=C sort -z)
+        else
+            # Refuse to emit a placeholder. A notices file that names a
+            # dependency but omits its license text is worse than a failed
+            # build: it looks complete to anyone relying on it, while shipping
+            # none of the attribution that dependency's license requires.
+            echo "ERROR: no saved license text for '${pkg}' — refusing to write an incomplete notices file." >&2
+            exit 1
+        fi
+    done < "${INDEX_FILE}"
+} > "${DRAFT_FILE}"
+
+mv "${DRAFT_FILE}" "${OUTPUT}"
+
+entries="$(grep -c '^| `' "${OUTPUT}" || true)"
+echo "Wrote ${OUTPUT} (${entries} entries)" >&2

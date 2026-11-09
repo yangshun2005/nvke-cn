@@ -1,0 +1,310 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# One check to require: `gate`.
+# Workflow authors: read .github/workflows/README.md before adding a member.
+#
+# WHY ONE AGGREGATE RATHER THAN A LIST OF JOB NAMES
+#
+# Two ways a required check blocks a pull request forever, and both apply here:
+#
+#   1. A check that never runs. Advisory workflows using NVIDIA runners trigger
+#      on a `push` to pull-request/N, so they only appear when copy-pr-bot
+#      mirrors the head -- which happens for vetted authors. Requiring one of
+#      those would block every unvetted contributor permanently.
+#
+#   2. A check that is skipped. Most workflows here carry `paths:` filters, so a
+#      pull request that does not touch their paths never reports them. GitHub
+#      treats a required-but-absent check as pending, not as passed.
+#
+# So the required context is this one job. It runs on `pull_request`, which every
+# author gets, and it reports a single result no matter which underlying checks
+# ran. Adding a module, growing a matrix or renaming a job then needs no change
+# to branch protection -- which matters, because the licence and govulncheck
+# matrices are generated from go.work.
+#
+# WHAT IS IN IT
+#
+# Everything that runs on a GitHub-hosted runner and is fast enough not to hurt
+# pull-request latency. Deliberately NOT in it: codeql, image,
+# secrets and security-scan, which keep reporting through mirror-branch pushes,
+# and deb, whose two-architecture package build is slow and only matters to an
+# agent release. Those remain advisory.
+#
+# `DCO` is not here either. It is a GitHub App rather than a workflow, it already
+# reports on every pull request regardless of author, and it should be required
+# directly alongside this one.
+#
+# HOW IT SEES THE OTHER CHECKS
+#
+# A job cannot `needs:` across workflows, so each one is called as a reusable
+# workflow. Each called workflow gained `workflow_call:` and lost its own
+# `pull_request:` trigger in the same change, so it runs once -- through here --
+# rather than twice on every pull request.
+# Gate members also have no direct `pull-request/N` or Dependabot push trigger.
+# The underlying PR already reaches the same checks through this workflow;
+# triggering its head branch directly would run the work a second time.
+#
+# A called workflow does NOT apply its own `paths:` filter, so everything below
+# runs on every pull request. That is deliberate: preserving the filters would
+# mean copying every path list into a `changes` job here, and two copies of a
+# path list is a thing that goes stale silently. Running the full set costs a few
+# minutes and cannot be wrong.
+
+name: Merge gate
+
+on:
+  # Stacked pull requests target another feature branch and still need the same
+  # required checks before they retarget or merge onward. Mirror branches are
+  # bot-owned transport, never intentional PR bases; excluding them avoids an
+  # accidental full gate on a pull-request/N base.
+  #
+  # A base-branch retarget is an `edited` event, which is not in GitHub's
+  # default pull_request activity set. Include it so an unchanged head cannot
+  # carry a gate result evaluated against its old base into the new one.
+  pull_request:
+    branches-ignore: ["pull-request/[0-9]+"]
+    types: [opened, synchronize, reopened, edited]
+  # Inert until someone enables a merge queue on `main`: with no queue, GitHub
+  # never sends this event. It is here so that enabling one is a settings change
+  # and not a settings change plus an outage.
+  #
+  # A merge queue builds its own commit on a gh-readonly-queue/ ref and requires
+  # the required contexts to report against THAT sha. Without this trigger `gate`
+  # would never report there, every entry would time out, and nothing would
+  # merge. The other required context, DCO, needs nothing from us: the app
+  # handles merge_group.checks_requested itself and reports on the merge group
+  # head sha.
+  #
+  # The called workflows need no change. Each declares workflow_call and runs
+  # under this caller's event, and none reads github.event.pull_request.
+  merge_group:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # Pull-request updates share a group and cancel stale gate runs. A manual run
+  # on main includes the sha, so dispatching one commit cannot displace another.
+  #
+  # This matters here because `gate` is required: a cancelled current run is
+  # indistinguishable from one still in progress, and the pull request never
+  # becomes mergeable.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so any workflow merge-gate.yml calls would
+  # share a group with its siblings and cancel them. 8 of 9 calls died that way,
+  # reported as failures with no jobs and no error message.
+  group: Merge gate-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    uses: ./.github/workflows/go-build.yml
+    permissions:
+      contents: read
+
+  controller-test:
+    uses: ./.github/workflows/controller-test.yml
+    permissions:
+      contents: read
+
+  # The `policy` job only: the registry against the tree, in about a second.
+  # Its sibling `report` job skips itself when called from here, because it
+  # would re-run the nine suites the lanes above have already run. See the
+  # header of coverage.yml.
+  coverage:
+    uses: ./.github/workflows/coverage.yml
+    permissions:
+      contents: read
+
+  agent-test:
+    uses: ./.github/workflows/agent-test.yml
+    permissions:
+      contents: read
+
+  packer-contracts:
+    uses: ./.github/workflows/packer-contracts.yml
+    permissions:
+      contents: read
+
+  management-engine-controller-test-policy:
+    uses: ./.github/workflows/management-engine-controller-test-policy.yml
+    permissions:
+      contents: read
+
+  workspace:
+    uses: ./.github/workflows/go-work-check.yml
+    permissions:
+      contents: read
+
+  chart:
+    uses: ./.github/workflows/chart.yml
+    permissions:
+      contents: read
+
+  nktp-chart:
+    uses: ./.github/workflows/nktp-chart.yml
+    permissions:
+      contents: read
+
+  licenses:
+    uses: ./.github/workflows/license.yml
+    permissions:
+      contents: read
+
+  generated:
+    uses: ./.github/workflows/generate-check.yml
+    permissions:
+      contents: read
+
+  # The layer above `generated`. That one proves the committed Go matches
+  # openapi.yaml; this one asks whether the openapi.yaml change is safe for a
+  # client already built against the published tag. A removed field passes the
+  # first and fails the second.
+  api-compat:
+    uses: ./.github/workflows/api-compat.yml
+    permissions:
+      contents: read
+
+  actionlint:
+    uses: ./.github/workflows/actionlint.yml
+    permissions:
+      contents: read
+
+  shellcheck:
+    uses: ./.github/workflows/shellcheck.yml
+    permissions:
+      contents: read
+
+  docs-check:
+    uses: ./.github/workflows/docs-check.yml
+    permissions:
+      contents: read
+
+  # The documentation site: MDX safety, `fern check` and `fern docs md check`.
+  # No secret and no publishing; see the header of fern-docs-ci.yml.
+  fern:
+    uses: ./.github/workflows/fern-docs-ci.yml
+    permissions:
+      contents: read
+
+  # Identifiers of internal infrastructure in the tree. Not a credential
+  # scan -- the Secrets workflow is that, and finds nothing here, because an
+  # org or subnet id grants nothing. What it protects is the property that
+  # this repository can become public.
+  internal-config-check:
+    uses: ./.github/workflows/internal-config-check.yml
+    permissions:
+      contents: read
+
+  # Tokens that carry a banned name, outside hack/name-check-allowlist.txt.
+  # Fail mode since 2026-10-11: every hit outside the allowlist fails. See the
+  # header of name-check.yml.
+  name-check:
+    uses: ./.github/workflows/name-check.yml
+    permissions:
+      contents: read
+
+  # The deploy executor's dry-run suite against deploy/nico, committed and
+  # rendered for a site; see the header of deploy-test.yml.
+  deploy-test:
+    uses: ./.github/workflows/deploy-test.yml
+    permissions:
+      contents: read
+
+  lint:
+    uses: ./.github/workflows/lint.yml
+    permissions:
+      contents: read
+
+  # The fault-injection suite. It starts PostgreSQL, an envtest API server and a
+  # Temporal dev server and runs the worker as a built binary, so it is the
+  # slowest member here at about six minutes. That still sits under the gate's
+  # wall clock, which golangci-lint (controller) sets at about nine.
+  # No secrets passed: gofail reads the CAPNICo CRDs from a committed fixture,
+  # so it passes for fork authors, who get no secrets on a pull_request. Its
+  # drift check runs only on the base repo's own events, not this called path.
+  gofail:
+    uses: ./.github/workflows/gofail-e2e.yml
+    permissions:
+      contents: read
+
+  # govulncheck needs more than contents:read -- it uploads SARIF. A called
+  # workflow cannot be granted less than its jobs request, or the whole file
+  # fails to start with no jobs and no error message.
+  # The fourth generated-artifact check. The other three (generated, chart via
+  # composition, and the proto/OpenAPI diffs) were already members; this one
+  # was not, so THIRD_PARTY_NOTICES.md drift could land on main.
+  notices:
+    uses: ./.github/workflows/notices-check.yml
+    permissions:
+      contents: read
+
+  govulncheck:
+    uses: ./.github/workflows/govulncheck.yml
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+
+  gate:
+    name: gate
+    # always(), so the gate still reports when something upstream failed. Without
+    # it the gate would itself be skipped, which reads to branch protection as
+    # "never ran" -- the exact failure this workflow exists to avoid.
+    if: always()
+    needs:
+      - build
+      - controller-test
+      - agent-test
+      - packer-contracts
+      - coverage
+      - management-engine-controller-test-policy
+      - workspace
+      - chart
+      - nktp-chart
+      - licenses
+      - generated
+      - api-compat
+      - actionlint
+      - shellcheck
+      - docs-check
+      - fern
+      - internal-config-check
+      - name-check
+      - deploy-test
+      - lint
+      - gofail
+      - notices
+      - govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every check to have passed
+        shell: bash
+        run: |
+          set -euo pipefail
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "  results: ${results}"
+
+          # Only `success` passes. Every member runs unconditionally in this
+          # repository: a called workflow ignores its own path filter, and the
+          # one job-level condition a member carries is the repository guard,
+          # `github.repository_id == '1323115536'`, which is true here whatever
+          # the repository is called. So a `skipped` member means a guard went
+          # false or a member grew a condition, and either way nothing was
+          # checked. Tolerating `skipped` is what let this gate pass with
+          # nothing run when the slug guards went false during the move to this
+          # organization. `cancelled` has proven nothing either.
+          for r in ${results}; do
+            case "${r}" in
+              success) ;;
+              *)
+                echo "::error::a required check did not report success: ${results}"
+                exit 1
+                ;;
+            esac
+          done
+          echo "  all required checks passed"
+          echo "### Merge gate passed" >> "${GITHUB_STEP_SUMMARY}"

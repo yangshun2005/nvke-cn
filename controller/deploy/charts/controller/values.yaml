@@ -1,0 +1,822 @@
+---
+# Default values for cloud-workflow-engine.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# This will set the replicaset count.
+# https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/
+replicaCount: 1
+
+# -- Annotations on the Deployment `metadata` (evaluated with `tpl`)
+deploymentAnnotations: {}
+
+# This sets the container image.
+# https://kubernetes.io/docs/concepts/containers/images/
+#
+# GHCR, not NVCR. image-nvcr.yml builds and pushes to NVCR, then promotes that
+# same digest to GHCR, so this names the identical image without needing an NGC
+# login. Override `image.repository` to go back to the NVCR copy.
+#
+# ⚠️ This is NOT yet an anonymously pullable image. This repository is
+# `internal`, and a GHCR package inherits that visibility on creation --
+# repository visibility does not change it, and nothing in CI changes it either.
+# Pulling still needs a GitHub token with `read:packages` until someone makes
+# the package public in its own settings. So this removes the NGC dependency; it
+# does not by itself make the chart installable by the public.
+image:
+  # -- Repository, including registry, for the nvke-controller image (the controller
+  # service) that this chart deploys. Override to pull it from a different
+  # registry (e.g. a private mirror); pair any change with a matching
+  # `imagePullSecrets` entry. Not to be confused with
+  # `profiles.image.repository` below, a separate optional content image.
+  repository: ghcr.io/dsx-ai-factory/nvke/nvke-controller
+  # -- This sets the pull policy for images.
+  pullPolicy: IfNotPresent
+  # -- Overrides the tag for the nvke-controller image; default is the chart
+  # appVersion.
+  tag: ""
+  # -- Optional digest (sha256:...) for the nvke-controller image. When set,
+  # the pod pulls by digest and the tag becomes informational only. Use this
+  # to pin an immutable image.
+  digest: ""
+
+# This is for the secrets for pulling an image from a private repository.
+# https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+#
+# Empty, and it has to match image.repository above. This defaulted to
+# `svc-nke-ngc-imagepull`, an NGC credential, which is right for an nvcr.io
+# image and useless for the ghcr.io one this chart now names: kubelet builds its
+# keyring from the secret, finds no ghcr.io entry, falls back to anonymous and
+# gets 401 on an internal package. The pair has to move together or the default
+# install fails everywhere.
+#
+# chart-publish-nvcr.yml puts the NGC secret back when it repoints the image at
+# nvcr.io, so the NVCR-published chart is unchanged for internal consumers.
+#
+# ⚠️ The GHCR package is `internal` today, so you still need a pull secret for
+# it. Create one with a GitHub token that has `read:packages` and set it here:
+#
+#   kubectl create secret docker-registry ghcr-imagepull \
+#     --docker-server=ghcr.io --docker-username=<user> --docker-password=<token>
+#
+#   --set imagePullSecrets[0].name=ghcr-imagepull
+# -- Must match image.repository, which defaults to ghcr.io. The
+# NVCR-published chart gets the NGC secret put back at package time. Supply
+# your own for a private GHCR package.
+imagePullSecrets: []
+# -- Overrides the chart name, and with it app.kubernetes.io/name, every
+# resource name derived from the fullname template, and the
+# serviceMonitor.matchLabels selector. Pinned rather than left empty: letting it
+# follow .Chart.Name would rename every object this chart owns whenever the
+# chart is renamed. AN INSTALL THAT PREDATES nvke-controller MUST PIN
+# "cloud-workflow-engine" HERE: the Deployment's spec.selector carries this
+# value and is immutable, so an upgrade that changes it is rejected by the API
+# server and fails rather than renaming. See
+# hack/testdata/chart-legacy-pinned-values.yaml for the full set of pins.
+nameOverride: "nvke-controller"
+fullnameOverride: ""
+# -- Deploy into this namespace instead of the release namespace (umbrella use).
+namespaceOverride: ""
+
+controllers:
+  bootstrap:
+    # -- Run the Kubernetes-native bootstrap controllers. Each runs only for Machines that opt in by label.
+    enabled: false
+  nico:
+    # -- Run controllers that watch NICo infrastructure resources.
+    enabled: true
+
+nodeAgent:
+  readiness:
+    # -- Maximum simultaneous node-agent readiness reconciles.
+    workers: 8
+    # -- Deadline for agent transport setup and version RPC.
+    timeout: "30s"
+    # -- Delay after a reconcile before its next periodic check.
+    interval: "2m"
+    # -- Symmetric fractional scheduling variation. Set 0 to disable jitter.
+    jitter: 0.1
+  # -- Installation method for agent convergence: apt or bundle. Required when clusters opt in.
+  updateMethod: ""
+  # -- SPIRE node attestation method pinned to newly created nodes. Changing
+  # this deployment default does not reconfigure existing nodes; keep their
+  # attestation plugins available until those nodes are retired or migrated.
+  # dsxImds also requires SPIFFE
+  # to be enabled and a DSX node image that installs the plugin and supplies
+  # DSX_IMDS_PLUGIN_CHECKSUM through /etc/spire-agent/spire-agent.env.
+  spireAttestationMethod: "tpm"
+  dsxImds:
+    # -- Operator tenant encoded in dsx_imds-attested SPIRE agent IDs. This
+    # must match the DSX Identity global.operatorTenant value.
+    operatorTenant: ""
+    # -- Metadata endpoint used by the external dsx_imds node attestor. The
+    # default is the standard link-local metadata service address.
+    endpoint: "http://169.254.169.254"
+    # -- Optional SHA-256 checksum for the external dsx_imds plugin binary.
+    # Leave empty to expand DSX_IMDS_PLUGIN_CHECKSUM from the node image's
+    # /etc/spire-agent/spire-agent.env file.
+    pluginChecksum: ""
+  tlsJwt:
+    # -- Pin JWT node authentication for newly created nodes. Existing nodes
+    # retain their stored transport; keep issuer/JWKS settings available while
+    # JWT-enabled nodes remain. Requires either
+    # spiffe.enabled or nodeAgent.externalMTLS.enabled.
+    enabled: false
+    # -- Identity issuer expected in node-agent JWTs.
+    issuer: ""
+    # -- HTTPS endpoint serving the issuer's JSON Web Key Set.
+    jwksURI: ""
+    # -- Asymmetric JWT signing algorithms accepted from the issuer.
+    algorithms:
+      - RS256
+    # -- Exact SPIFFE trust domain accepted in node-agent JWT subjects.
+    subjectTrustDomain: ""
+    # -- Tenant segment in the canonical local SPIFFE ID exchanged by DSX Identity.
+    subjectTenant: ""
+    # -- Service segment in the canonical local SPIFFE ID exchanged by DSX Identity.
+    subjectService: ""
+    # -- DSX Identity token-exchange endpoint injected into node-agent bootstrap
+    # arguments when TLS/JWT is enabled.
+    dsxIdentityExchangeURL: ""
+  externalMTLS:
+    # -- Pin an externally managed client certificate transport for newly
+    # created nodes instead of the controller SPIRE X509-SVID. Keep the Secret
+    # available while nodes using this transport remain. Requires node agent
+    # 0.3.0 or later, which reads --nvke-controller-client-ca-bundle.
+    enabled: false
+    secret:
+      # -- Name of the externally managed Secret containing the client identity.
+      name: ""
+      # -- Secret key containing the PEM-encoded client certificate chain.
+      certificateKey: tls.crt
+      # -- Secret key containing the PEM-encoded client private key.
+      privateKeyKey: tls.key
+      # -- Secret key containing the PEM-encoded issuing CA bundle.
+      caBundleKey: ca.crt
+      # -- Optional Secret key containing the new-form PEM-encoded client
+      # certificate chain. Set together with newPrivateKeyKey; leave empty for
+      # nodes that only use the original identity.
+      newCertificateKey: ""
+      # -- Optional Secret key containing the new-form PEM-encoded client private key.
+      newPrivateKeyKey: ""
+
+# identity configures the strings this controller compiles into
+# Server-Side-Apply field managers and the nvke.nvidia.com/managed-by label
+# value. Every value here defaults to today's literal, so an unset value is
+# today's behavior exactly.
+identity:
+  # -- Field manager for this controller's own CAPI/NICo Server-Side-Apply patches.
+  fieldManagerName: "cloud-workflow-engine"
+  # -- Field manager scoped to the CAPI Machine reboot annotation alone.
+  fieldManagerRebootMachineName: "cloud-workflow-engine-reboot-machine"
+  # -- Field manager used when patching a Machine's health-issue annotation.
+  fieldManagerMachineHealthIssueName: "cloud-workflow-engine-machine-health-issue"
+  # -- Value written under the nvke.nvidia.com/managed-by label on objects this
+  # controller owns, and the value the tenant Secret reconciler filters on.
+  managedByLabelValue: "cloud-workflow-engine"
+
+# nkeSystemNamespace is the older name for nvkeSystemNamespace. It is absent
+# here on purpose: the guard in _helpers.tpl keys off its presence, so setting
+# it at all fails the render naming the new key, rather than letting Helm drop
+# an unknown key silently and fall back to the nvkeSystemNamespace defaults.
+nvkeSystemNamespace:
+  # -- Name of the shared management-plane namespace: the Namespace object, the
+  # Roles and RoleBindings in it, and the namespace the controller publishes
+  # tenant-access Secrets into and reads rbacConfigMap.name from. Empty
+  # means nvke-system. A SITE INSTALLED BEFORE THIS VALUE EXISTED MUST PIN
+  # nke-system HERE: the old namespace is not also read, so a site that moves
+  # leaves its published kubeconfig and trust-bundle Secrets behind in it.
+  name: "nvke-system"
+  # -- Create the shared management namespace. The object always carries
+  # helm.sh/resource-policy: keep so a Helm uninstall does not delete it, and
+  # argocd.argoproj.io/sync-options: Prune=false,Delete=false so an Argo prune or
+  # Application delete does not either. Both are set by the template for default delete protection.
+  create: true
+  # -- Extra annotations merged onto the namespace. This is useful for
+  # adding additional annotations to the namespace to protect it from being deleted. Listing annotations that
+  # template already defaults here duplicates the key in the rendered Namespace.
+  annotations: {}
+
+# This section builds out the service account.
+# https://kubernetes.io/docs/concepts/security/service-accounts/
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Automatically mount a ServiceAccount's API credentials?
+  automount: true
+  # Annotations to add to the service account
+  annotations: {}
+  # -- The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: cloud-workflow-engine
+
+# This is for setting Kubernetes Annotations to a Pod.
+# For more information checkout:
+# https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/
+podAnnotations: {}
+# This is for setting Kubernetes Labels to a Pod.
+# For more information checkout: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+podLabels:
+  app: cloud-workflow-engine
+  project: nvke
+  team: nvke
+
+# The uid is set here rather than left to the image so that every container in
+# the pod runs unprivileged, including the materialize-profiles init container,
+# whose operator-built content image usually has no USER of its own. 65532 is
+# the controller image's USER.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# This is for setting up a service.
+# https://kubernetes.io/docs/concepts/services-networking/service/
+service:
+  # This sets the service type.
+  # https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types
+  type: ClusterIP
+  # -- apiserver port
+  port: 8080
+  # -- NodePort to publish the apiserver on, via a second Service beside the one
+  # above. Empty renders no such Service. Set it where the API has to be
+  # reachable without a cluster route -- the host running `nvkectl bootstrap
+  # site`, or an operator reaching /api on a node address. This does not change
+  # the Service above, which stays ClusterIP for in-cluster callers.
+  nodePort: ""
+  # -- Additional annotations for the service
+  annotations: {}
+  # -- Additional labels for the service
+  labels: {}
+
+metrics:
+  # -- Port for the dedicated Prometheus metrics server.
+  # Must match the port in listenAddress.
+  port: 9090
+  # -- listenAddress controls which interface the metrics server binds.
+  # Set to 0.0.0.0:<port> when a NetworkPolicy is in place to restrict access.
+  listenAddress: "0.0.0.0:9090"
+  networkPolicy:
+    # -- enabled controls whether a NetworkPolicy is created to restrict metrics
+    # port access to the Prometheus and Alloy scraper namespaces.
+    enabled: true
+    # -- additionalNamespaces allows extra namespaces to scrape the metrics port.
+    additionalNamespaces: []
+
+tracing:
+  # -- Export OpenTelemetry spans to an OTLP collector, at tracing.endpoint or the endpoint
+  # the OpenTelemetry Operator injects. Keep false in chart defaults; enable per environment.
+  enabled: false
+  # OpenTelemetry Operator injection. When enabled (with tracing.enabled), add
+  # standard Operator annotations so inject-sdk / sidecar inject can supply
+  # OTEL_* env and a collector sidecar. Prefer inject-sdk over inject-go when
+  # using the manual Go SDK. Leave annotation values empty in chart defaults;
+  # set them per environment to the Instrumentation / OpenTelemetryCollector
+  # resource names in that cluster (e.g. "observability/default-instrumentation").
+  operatorInject:
+    # -- When true (with tracing.enabled), add OpenTelemetry Operator pod annotations.
+    enabled: false
+    # -- Value for instrumentation.opentelemetry.io/inject-sdk (namespace/name).
+    injectSdk: ""
+    # -- Value for sidecar.opentelemetry.io/inject (namespace/name).
+    injectSidecar: ""
+  # -- Optional OTLP gRPC endpoint override (host:port). Leave empty when
+  # operatorInject.enabled is true so the operator-injected localhost sidecar
+  # endpoint is used.
+  endpoint: ""
+  # -- Use insecure (plaintext) OTLP gRPC. Required for localhost sidecar / most in-cluster collectors.
+  insecure: true
+  # -- Resource attribute service.name written when tracing.endpoint is set.
+  # With operatorInject, prefer operator-injected OTEL_SERVICE_NAME instead.
+  serviceName: "cloud-workflow-engine"
+
+# ServiceMonitor configuration for Prometheus monitoring
+serviceMonitor:
+  # -- Enable/disable ServiceMonitor creation. ANDed with the umbrella
+  # kill-switch `global.monitoring.enabled`, which is treated as true when
+  # unset so standalone installs are unaffected.
+  enabled: true
+  # -- Name of the ServiceMonitor
+  name: cloud-workflow-engine-metrics
+  # -- Additional labels for the ServiceMonitor
+  labels: {}
+  # -- Selector labels to match the service. Values here win over the
+  # selector labels the chart derives from `nameOverride`/`fullnameOverride`,
+  # so an unset value here (the default) lets the derived labels through
+  # instead of silently overriding them with a stale literal.
+  matchLabels: {}
+
+# This block is for setting up the ingress.
+# https://kubernetes.io/docs/concepts/services-networking/ingress/
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+  #  - secretName: chart-example-tls
+  #    hosts:
+  #      - chart-example.local
+
+resources: {}
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user. This also increases chances charts run on environments with little
+  # resources, such as Minikube. If you do want to specify resources, uncomment the following
+  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+# -- Comma-separated API provider blocks accepted by mutating cluster and node-pool requests: `nico`, `launchLayer` and `infra`. The chart defaults the deployed controller to Nico only. Add `launchLayer` for deployments with CAPLL installed; with `spiffe.enabled` it also needs `nodeAgent.spireAttestationMethod: dsxImds`, which applies to every provider's new nodes, so a TPM-attested NICo deployment cannot add `launchLayer`. Add `infra` only for deployments that should accept generic CAPI-backed provider payloads.
+supportedInfraProviders: "nico"
+
+nodeMetadata:
+  # -- Allowlist of label keys under the reserved kubernetes.io and k8s.io domains. Intended for operators whose deployments specifically need labels from these domains.
+  # Use with care: these keys can conflict with Kubernetes core components.
+  # `node-role.kubernetes.io/control-plane` and keys under the internal NVKE domains cannot be listed.
+  # The controller validates the allowlist and refuses to start if an entry is one of the above forbidden keys, or is empty, padded, not a valid label key, or a duplicate.
+  allowlistedLabelKeys: []
+
+machineMetadata:
+  # -- Exact Machine label keys allowed under reserved NVKE, Kubernetes and Cluster API domains. Use with care: these keys may affect controller behavior.
+  allowlistedLabelKeys: []
+  # -- Exact Machine annotation keys allowed under reserved domains, for example a configuration-profile selection annotation. Values remain free-form strings.
+  allowlistedAnnotationKeys: []
+
+# -- Additional environment variables to inject into the controller container. A
+# variable nvke-controller-config carries is refused; set its chart value instead.
+# CONTROLLER_CONFIG_PATH is refused too: the chart sets it to the mounted file.
+env: []
+# - name: EXAMPLE
+#   value: example
+
+# This is to setup the liveness and readiness probes.
+# https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+livenessProbe:
+  null
+  # httpGet:
+  #   path: /
+  #   port: http
+readinessProbe:
+  null
+  # httpGet:
+  #   path: /
+  #   port: http
+
+# This section is for setting up autoscaling.
+# https://kubernetes.io/docs/concepts/workloads/autoscaling/
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+# -- Additional init containers on the output Deployment definition, rendered
+# ahead of the app container.
+additionalInitContainers: []
+# - name: wait-for-db
+#   image: busybox
+#   command: ['sh', '-c', 'until nc -z db 5432; do sleep 2; done']
+
+# Additional volumes on the output Deployment definition.
+volumes: []
+# - name: foo
+#   secret:
+#     secretName: mysecret
+#     optional: false
+
+# Additional volumeMounts on the output Deployment definition.
+volumeMounts: []
+# - name: foo
+#   mountPath: "/etc/foo"
+#   readOnly: true
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+releaseCRDs:
+  # -- Install the MachineImage, ClusterRelease and NodePoolRelease CRDs with
+  # the chart.
+  install: true
+
+capi:
+  rbac:
+    # -- Create RBAC for the controller to watch and patch CAPI-backed infrastructure resources.
+    create: false
+    # -- Grant RBAC for NICo's CRDs (nicoclusters, nicomachines). Only applies when `create` is true.
+    # Setting it false requires `controllers.nico.enabled: false`.
+    nico: true
+    # -- Grant RBAC for LaunchLayer's CRDs (launchlayerclusters, launchlayermachines,
+    # launchlayermachinetemplates). Only applies when `create` is true.
+    # Keep it true while CAPLL's CRDs are installed.
+    launchLayer: true
+
+kubeadm:
+  # -- OCI registry kubeadm uses for control-plane component images.
+  imageRepository: registry.k8s.io
+
+cni:
+  # -- Permit new tenant clusters to use the legacy Calico CNI. Existing Calico
+  # clusters remain manageable when false. Legacy fleets that still create
+  # Calico clusters must set this before upgrading the controller. This
+  # compatibility setting is for legacy fleets only. New deployments must use
+  # OVN-Kubernetes.
+  allowLegacyCalicoClusterCreation: false
+  # -- Optional OCI registry prefix for CNI component images. Empty uses chart defaults.
+  imageRegistry: ""
+  # -- Install CNI after kubeadm init through the agent's InstallCNI RPC, which
+  # reads manifests from a Debian package rather than a bundle server. Needs the
+  # CNI charts package on the node that runs kubeadm init: nvke-cni-ovn-charts-<stream>
+  # for OVN, or nvke-cni-calico-manifests-<stream> for Calico.
+  installAfterInit: false
+
+tenantAccess:
+  # -- Publish each cluster's kubeconfig as a Secret in the shared management
+  # namespace (nvkeSystemNamespace.name),
+  # and remove those Secrets during cluster teardown. Gates both the controller
+  # and its cleanup activity, and the Secret grant they depend on.
+  enabled: true
+  # -- Additional RBAC objects applied to OIDC tenant clusters through nke-rbac.
+  # Requires spiffe.trustDomain and tenantAccess.enabled. Use unique object names.
+  additionalRBAC: []
+
+# nkeOIDCAuth is the older name for nvkeOIDCAuth. It is absent here on purpose:
+# the guard in _helpers.tpl keys off its presence, so setting it at all fails
+# the render naming the new key, rather than letting Helm drop an unknown key
+# silently and leave OIDC at enabled: false.
+nvkeOIDCAuth:
+  # -- Enable OIDC authentication from NVKE management identities to tenant cluster kube-apiservers.
+  enabled: false
+  # -- Name of the ClusterRole/Role/Binding objects the tenant-access controller
+  # applies into every tenant cluster (nvke-rbac.yaml).
+  tenantRbacName: "nvke:cwe"
+  # -- OIDC issuer URL trusted by tenant kube-apiservers.
+  issuerURL: ""
+  # -- Optional discovery URL override used when issuerURL is not directly reachable by tenant kube-apiservers.
+  discoveryURL: ""
+  caBundleSecret:
+    # -- Namespace of the Secret containing the OIDC CA bundle.
+    namespace: ""
+    # -- Name of the Secret containing the OIDC CA bundle.
+    name: ""
+    # -- Key in the Secret containing the OIDC CA bundle.
+    key: ""
+
+oidc:
+  # -- Fleet-wide OIDC providers that clusters trust alongside nvkeOIDCAuth; a
+  # cluster keeps the list it was created with, and one created on a
+  # Kubernetes version earlier than 1.34 gets none. At most five, each with
+  # name, issuerURL, audiences, usernameClaim, usernamePrefix and caBundle
+  # (inline PEM), and optionally groupsClaim, groupsPrefix, requiredClaims
+  # (claim name to required value) and discoveryURL (where tenant API servers
+  # fetch the issuer's discovery document when they cannot reach issuerURL).
+  # For example:
+  #   - name: corp
+  #     issuerURL: https://login.example.com
+  #     audiences: [nke]
+  #     usernameClaim: email
+  #     usernamePrefix: "corp:"
+  #     groupsClaim: groups
+  #     groupsPrefix: "corp:"
+  #     caBundle: |
+  #       -----BEGIN CERTIFICATE-----
+  #       ...
+  #       -----END CERTIFICATE-----
+  providers: []
+
+# NVKE API authentication. The chart always mounts the configuration ConfigMap,
+# and creates it too when apiAuth.configMap.create is set. See the README for
+# the schema.
+apiAuth:
+  # -- Enable NVKE API authentication.
+  enabled: false
+  # -- Count what enforcement would have refused but serve the request anyway.
+  # Watch nvke_auth_requests_total{outcome="would_reject"} before enforcing.
+  permissive: false
+  configMap:
+    # -- Render `apiAuth.config` into both `nvke-controller-config`, which is
+    # what the controller reads, and the ConfigMap named below, a copy for
+    # `nvkectl` and `extraFiles`, rather than mounting one managed elsewhere.
+    # The two are alternatives: setting `config` without this, or this without
+    # `config`, fails the render rather than silently ignoring one of them.
+    create: false
+    # -- ConfigMap holding the authentication configuration, keyed `auth.yaml`.
+    # Required when apiAuth.enabled=true; an empty name fails the render.
+    # Created by the chart when configMap.create=true, mounted either way. An
+    # install that predates nvke-auth-config sets "nke-auth-config": renaming it
+    # orphans the live object, and with configMap.create=false the pod stays in
+    # ContainerCreating until the named ConfigMap exists.
+    name: nvke-auth-config
+    # -- Extra files to place beside `auth.yaml`, keyed by filename. Only used
+    # when configMap.create=true. The whole ConfigMap is mounted, so each one
+    # lands in the same directory and can be named by a `jwks.caBundlePath` as
+    # /etc/nke/auth/<filename>. For an issuer behind a private CA, prefer the
+    # PEM inline as `jwks.caBundle` in `config`, which needs no file; a CA
+    # bundle is a public certificate, not a secret. The render fails if
+    # `caBundlePath` names a file in that directory that is not listed here,
+    # rather than leaving NVKE to crash-loop on a missing file.
+    #
+    # extraFiles:
+    #   spire-ca.crt: \|
+    #     -----BEGIN CERTIFICATE-----
+    #     ...
+    #     -----END CERTIFICATE-----
+    extraFiles: {}
+  # -- The AuthenticationConfiguration itself. With `configMap.create` the chart
+  # renders it into the `apiAuth` section of `nvke-controller-config`, which is
+  # what the controller reads, and verbatim into the ConfigMap named by
+  # `configMap.name`, a copy for `nvkectl` and `extraFiles`. Carries `audiences`
+  # and `issuers` only: apiVersion and kind are supplied by the chart, which
+  # ships in lockstep with the build that accepts them, `enabled` is
+  # `apiAuth.enabled`, and `permissive` is `apiAuth.permissive`.
+  #
+  # The render checks that both keys are present and refuses `apiVersion`,
+  # `kind`, `enabled` and `permissive` here, and nothing more. The controller applies
+  # auth/authn's rules at startup and its errors name the offending field; a
+  # second copy of them in Helm would drift the first time an issuer gains a new
+  # key. The cost is that a bad value fails at pod start rather than at render.
+  #
+  # config:
+  #   audiences: ["https://nke.example.internal"]
+  #   issuers:
+  #     - name: local-kubernetes
+  #       issuer: "https://kubernetes.default.svc.cluster.local"
+  #       jwks:
+  #         uri: "https://kubernetes.default.svc/openid/v1/jwks"
+  #         caBundlePath: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+  #         bearerTokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
+  #       algorithms: [RS256, ES256]
+  #       admit:
+  #         serviceAccounts:
+  #           - namespace: cloud-workflow-engine
+  #             name: forge-console
+  config: {}
+  # -- Bind system:service-account-issuer-discovery so NVKE can read the cluster's
+  # JWKS. Only used by an issuer that points `jwks.uri` at that endpoint.
+  # Kubernetes already grants this to every service account, so a stock cluster
+  # needs nothing. Keep it for clusters that removed that default.
+  clusterIssuerDiscovery: true
+
+scheduledMaintenance:
+  certRenewal:
+    # -- Enable controller-owned periodic Kubernetes control-plane certificate renewal.
+    enabled: true
+    # -- Interval between certificate renewal checks for each cluster (1h through 24h while renewal is enabled; the chart refuses other values).
+    interval: 12h
+    # -- Days before expiry that the runbook renews certificates (7 through 90 while renewal is enabled; with credential monitoring also enabled, credentialMonitoring.warningDays must exceed it by at least two renewal intervals, so the default maximum is 44; the chart refuses other values).
+    thresholdDays: 30
+
+secrets:
+  # -- Create the DB connection Secret from appDb values. Disabled by default;
+  # set true only when not using an external secret manager (e.g. Vault Secrets Operator).
+  # Requires appDb.postgresUser and appDb.postgresPassword to be explicitly configured.
+  createDbSecret: false
+  # -- If specified, secret is created with the name provided.
+  # Otherwise defaults to name based on fullname template.
+  dbSecretName: ""
+  # -- secretKey with db connectionString. If not specified, defaults to "database-connection-string"
+  dbSecretKey: ""
+  # -- Name of the Kubernetes Secret (created out-of-band by Vault Secrets Operator)
+  # providing DGXC tenant credentials. Expected keys: user, password.
+  # When empty, DGXC_TENANT_USER and DGXC_TENANT_PASSWORD are not injected.
+  dgxcTenantCredSecretName: ""
+  # -- Name of the Kubernetes Secret (created out-of-band by Vault Secrets Operator)
+  # providing CNPG database passwords. Expected keys: CNPG_SUPERUSER_PASSWORD,
+  # CNPG_CLOUD_PASSWORD, CNPG_TEMPORAL_PASSWORD.
+  # When empty, CNPG_* env vars are not injected. When set, all three keys are
+  # required to exist in the named Secret.
+  cnpgDbPasswordsSecretName: ""
+
+appDb:
+  url: postgresql:5432
+  dbName: cloud-workflow
+  postgresUser: ""
+  postgresPassword: ""
+  # -- TLS mode for the DB connection string (e.g. disable, require, verify-full).
+  sslMode: ""
+
+temporal:
+  host: temporal-frontend.temporal.svc.cluster.local
+  port: 7233
+  publicTemporalHostPort: ""
+  mtls:
+    # -- Enable mTLS when connecting to Temporal.
+    enabled: false
+    # -- Secret containing ca.crt, tls.crt, and tls.key for the Temporal client.
+    secretName: ""
+    # -- Mount path for the Temporal client certificate secret.
+    mountPath: /var/secrets/temporal/certs/client
+    caCertFile: ca.crt
+    clientCertFile: tls.crt
+    clientKeyFile: tls.key
+    serverName: ""
+  cloudWorkflow:
+    namespace: cloud-workflow-engine
+    queue: cloud-workflow-engine-tasks
+
+profiles:
+  # Directory the controller reads OS/config profiles from (profilesDir) and profile-hook
+  # scripts from its runbooks/ child (runbooksDir).
+  # When image.enabled is true, an initContainer copies /profiles from the
+  # profiles content image into an emptyDir mounted at this path.
+  # -- Directory mounted and read as profilesDir
+  path: ""
+  # -- Directory read as runbooksDir for config-profile hook scripts. Empty
+  # uses the runbooks/ directory under path.
+  runbooksPath: ""
+  image:
+    # Materialize fleet profiles from an external OCI content image. Prefer
+    # digest pins so Deployment rolls on profile changes.
+    #
+    # Still nvcr.io, unlike image.repository above, and deliberately so: this
+    # independently published content image does not have a GHCR counterpart in
+    # this repository. It is disabled by default, so the chart still renders
+    # with no nvcr.io reference.
+    #
+    # ⚠️ If you enable this, you need an NGC pull secret as well as whatever
+    # imagePullSecrets entry the controller image needs -- the two images are in
+    # different registries. imagePullSecrets above is empty by default, so
+    # enabling profiles without adding one puts the init container into
+    # ImagePullBackOff:
+    #
+    #   --set imagePullSecrets[0].name=svc-nke-ngc-imagepull
+    # -- Copy `/profiles` from a content image into profiles.path
+    enabled: false
+    # -- Repository, including registry, for the fleet profiles content image
+    # (not the nvke-controller image above). Override to pull it from a
+    # different registry (e.g. a private mirror); pair any change with a
+    # matching `imagePullSecrets` entry.
+    repository: nvcr.io/j7sbcjl3qgta/cwe-profiles
+    # -- Tag for the profiles content image (used when digest is empty)
+    tag: ""
+    # -- Digest pin for the profiles content image (preferred; e.g. `sha256:…`)
+    digest: ""
+
+# -- Development only: permit control-plane creation, scale-up, upgrades and replacement
+# without a VIP. The API endpoint uses the initializing node's IP; replacing that
+# node can interrupt API access. Quorum and deletion protections still apply.
+allowControlPlaneWithoutVIP: false
+
+controllerConfig:
+  # -- Name of the ConfigMap that carries the controller's settings file, and
+  # that the Deployment mounts and Reloader watches. An install that predates
+  # nvke-controller-config sets "nke-controller-config": renaming the ConfigMap
+  # orphans the live object.
+  name: "nvke-controller-config"
+
+rbacConfigMap:
+  # -- Name of the ConfigMap in nvkeSystemNamespace.name that carries the RBAC
+  # manifest the tenant-access controller applies into every tenant cluster, and
+  # whose User subjects fleet-wide OIDC providers may not claim. It also names
+  # the Role and RoleBinding that grant the controller get on it, and the
+  # resourceNames entry in that Role: all four follow this one value, because a
+  # ConfigMap the Role does not name is a ConfigMap the controller is denied.
+  # An install that predates nvke-rbac sets "nke-rbac": the controller reads
+  # only the name set here, so renaming it leaves the live manifest unread and
+  # tenant RBAC unapplied.
+  name: "nvke-rbac"
+
+spiffe:
+  # -- Enable SPIFFE identity for mTLS to tenant clusters
+  enabled: false
+  # -- First path segment of the SPIFFE IDs the nvkeOIDCAuth.tenantRbacName and
+  # capi-cluster-admin RBAC subjects default to, as in
+  # spiffe://<trustDomain>/<servicePathSegment>/<serviceAccount>. It must equal
+  # the segment the ClusterSPIFFEID spiffeIDTemplate issues
+  # (deploy/k8s/spire-nvke-services-spiffe-id.yaml), or every default subject
+  # matches nothing and a tenant authenticates the controller and then denies it.
+  # An install that predates nvke-service sets "nke-service": its SPIRE server
+  # keeps issuing that path, and node agents older than the nvke rename admit
+  # only it. A new install issues nvke-service, which agents admit from the nvke
+  # rename on.
+  servicePathSegment: "nvke-service"
+  endpointSocket: "unix:///spiffe-workload-api/spire-agent.sock"
+  # -- RFC 8693 token-exchange endpoint the exec credential plugin trades its
+  # JWT-SVID at before calling a tenant API server. Leave empty to present the
+  # JWT-SVID directly, which is what every site does today. Set it only where the
+  # tenant clusters trust the exchange's issuer, otherwise the controller's calls
+  # to them will start failing authentication.
+  jwtExchangeEndpoint: ""
+  # -- Subject the nvkeOIDCAuth.tenantRbacName RBAC bindings name in tenant clusters. Defaults to this
+  # controller's own SPIFFE ID, spiffe://<trustDomain>/<servicePathSegment>/<serviceAccount>,
+  # which is what a tenant sees when no exchange is in play. Set it whenever
+  # jwtExchangeEndpoint is set: the exchange re-issues the token under its own trust
+  # domain and rewrites the path, so give the exchanged subject in full, e.g.
+  # spiffe://nke.<site>.cloud-workflow-engine.nvid.id/bm/cwe. A mismatch authenticates
+  # and then fails every authorization check.
+  controllerSubject: ""
+  # -- Older name for controllerSubject, still read. When both are set,
+  # controllerSubject wins.
+  cweSubject: ""
+  # -- Subject the nvke:capi-cluster-admin RBAC binding names for capi-manager.
+  # Defaults to spiffe://<trustDomain>/<servicePathSegment>/capi-manager, which is what a
+  # tenant sees without token exchange. Set it whenever jwtExchangeEndpoint is
+  # set because the exchange may rewrite the token's sub claim.
+  capiManagerSubject: ""
+  # -- Subject the nvke:capi-cluster-admin RBAC binding names for the kubeadm
+  # control-plane manager. Defaults to its local SPIFFE ID; set it to the
+  # rewritten subject when that controller uses an exchanged tenant kubeconfig.
+  capiKubeadmControlPlaneManagerSubject: ""
+  # -- Subject the nvke:capi-cluster-admin RBAC binding names for the kubeadm
+  # bootstrap manager. Defaults to its local SPIFFE ID; set it to the rewritten
+  # subject when that controller uses an exchanged tenant kubeconfig.
+  capiKubeadmBootstrapManagerSubject: ""
+  # -- Subject the nvke:capi-cluster-admin RBAC binding names for the CAPD
+  # manager. Defaults to its local SPIFFE ID; set it to the rewritten subject
+  # when CAPD uses an exchanged tenant kubeconfig.
+  capdManagerSubject: ""
+  # -- Subject the nvke:capll-manager RBAC binding names for the CAPLL manager,
+  # rendered when supportedInfraProviders includes launchLayer. Defaults to
+  # spiffe://<trustDomain>/<servicePathSegment>/capi-provider-launchlayer-controller-manager,
+  # the ServiceAccount of CAPLL's chart under its default release name. With
+  # jwtExchangeEndpoint set, the binding is rendered only when this is set.
+  capllManagerSubject: ""
+  # -- SPIRE trust domain. When set, the chart renders ConfigMap rbacConfigMap.name.
+  # Required when nvkeOIDCAuth.enabled is true: builds the
+  # nvkeOIDCAuth.tenantRbacName SPIFFE subject ID in that ConfigMap. Must equal the
+  # SPIRE server's trust domain (the spire chart's global.spire.trustDomain) so the
+  # RBAC principals match issued identities.
+  trustDomain: ""
+  spire:
+    serverNamespace: "spire-server"
+    className: "spire-mgmt-spire"
+    tpmPubhashesConfigMapName: "tpm-pubhashes"
+    # -- SPIRE server address. When unset, serverAddressFrom is used.
+    serverAddress: ""
+    # -- Kubernetes valueFrom source for SPIRE server address when serverAddress is unset.
+    serverAddressFrom:
+      fieldRef:
+        fieldPath: status.hostIP
+    serverPort: "30440"
+    # -- TTL used when creating SPIRE join tokens through the SPIRE server API.
+    joinTokenTTL: "1h"
+
+teleport:
+  # -- Enable Teleport identity for the controller to manage Teleport resources (tokens, nodes)
+  enabled: false
+  # -- Teleport proxy address (site-specific, must be set per environment)
+  proxyAddress: ""
+  # -- Teleport environment label: "prod" or "non-prod" (default: "non-prod")
+  environment: "non-prod"
+  # -- Path where the tbot identity file is mounted
+  identityFile: "/var/run/teleport/identity"
+  # -- Name of the Kubernetes secret containing the tbot identity (written by tbot output)
+  identitySecretName: "cloud-workflow-engine-teleport"
+  # -- Value of the Teleport "managed-by" label this controller stamps on
+  # tokens it creates. An existing site pins its old value
+  # ("nke-cloud-workflow-engine"), or moves it and lists the old one under
+  # acceptedManagedByLabelValues below.
+  managedByLabelValue: "nvke-controller"
+  # -- Further "managed-by" values this controller still owns without writing.
+  # Tokens are labelled at mint and nodes at join, and neither is ever
+  # relabelled, so moving managedByLabelValue disowns every token and node
+  # already carrying the old value: they stop being listed, cannot be deleted,
+  # and nothing reaps them. List the previous value here until no resource
+  # carries it -- for a site that has run any earlier chart, that means
+  # "nke-cloud-workflow-engine" and, if it pinned one of its own, that pin too.
+  acceptedManagedByLabelValues: []
+  # -- Prefix for the deterministic Teleport TPM join token name this
+  # controller mints for a node. An existing site pins "nke-cwe-".
+  tokenNamePrefix: "nvke-controller-"
+  # -- Value of the Teleport "resource-group" label stamped on the tokens and
+  # node userdata this controller creates. An existing site pins "nke".
+  resourceGroupLabelValue: "nvke"
+
+# Read-only credential inventory is independent of automated renewal.
+credentialMonitoring:
+  # -- Enable read-only node certificate and direct tenant API CSR observations independently of renewal. When false, the inspection and CSR availability alerts and the stale and failed CSR alerts are suppressed, because nothing observes those series.
+  enabled: true
+  # -- Interval between node certificate inspection attempts (5m through 12h while monitoring is enabled; the chart refuses other values).
+  inspectionInterval: "1h"
+  # -- Maximum usable observation age; always positive, and at least twice inspectionInterval and at most 24h while monitoring is enabled. The chart refuses other values.
+  observationMaxAge: "3h"
+  # -- Warn this many days before expiry; always positive, 9 through 120 while monitoring is enabled, and with renewal also enabled it must exceed the renewal threshold by at least two renewal intervals. The chart refuses other values.
+  warningDays: 45
+  alerts:
+    # -- Install credential PrometheusRules. Requires Prometheus Operator CRDs, a selecting rule evaluator, and Alertmanager routing.
+    enabled: false
+    # -- Additional PrometheusRule labels for the evaluator's rule selector.
+    labels: {}

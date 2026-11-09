@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Sample E2E config for the NVKE suite. Every field has a default, so a missing
+# file (or an empty one) runs zero-config against the current kube context. The
+# values below are the defaults; uncomment and edit as needed.
+#
+# Cluster shape (Kubernetes version, CNI plugin, name) and waiter timeouts live
+# in the test code, not here — this file only carries environment knobs.
+
+# kube:
+#   kubeconfig: ""   # "" -> default loading (KUBECONFIG / ~/.kube/config)
+#   context: ""      # "" -> current-context
+
+# cluster:
+#   capdNodeImage: "cwe-capd-kindest-node:local"   # CAPD backend only
+
+# lifecycle:
+#   skipDelete: false         # leave the tenant cluster running after the suite
+#   preserveOnFailure: false  # keep the cluster only when a spec fails
+#   reuseCluster: ""          # non-empty -> verify this existing cluster, skip create
+
+# The machines an infrastructure provider creates, rather than what is built
+# on them. The same shape carries a site controller and the tenant nodes it
+# goes on to provision, so this sits outside site.
+# node:
+#   # The account the OS image bakes, which is the login every session uses.
+#   # "" is what the OSS os-image releases bake; images from the internal
+#   # pipeline bake dgxc-admin. It has to match the image named by
+#   # -e2e.versions os-image, or cloud-init writes authorized_keys for an
+#   # account that does not exist.
+#   user: ""            # "" -> ubuntu
+
+# The site lane builds a site controller on a Forge node (-e2e.site-stage=
+# provision|bootstrap|deployment|full). `gmake site-inputs SITE_NVKE_CONTROLLER_VERSION=...`
+# builds nvkectl and the image archives below, pulling the published images
+# from SITE_IMAGE_REGISTRY: GHCR by default, or nvcr.io/<NGC org> after a
+# `docker login nvcr.io` with an NGC key. Secrets come only from the
+# environment: FORGE_API_KEY.
+#
+# This block names only where artifacts come from. Component versions are
+# -e2e.versions keys (controller, capi-provisioned, os-image,
+# os-image-bootloader, and cli, which is recorded but not checked against
+# site.nvkectl). The two OS-image keys may be suffixed with an architecture, as
+# os-image-arm64, which is how one run boots two: a GB200 tenant puts arm64
+# workers behind an amd64 control plane, and each role boots the image built
+# for its own machine. The unsuffixed key is what a run on one architecture
+# passes, and is used when no suffixed one is given. The jump host and its
+# login are the site's and live in environments/<name>.yaml, from
+# FORGE_JUMP_HOST and FORGE_TELEPORT_LOGIN.
+# site:
+#   deployPathRef: ""   # "" -> the controller version's commit, or its
+#                       #       controller/<version> release tag
+#   # Each image the node stages: the reference it is bootstrapped and
+#   # deployed with, and the archive carrying it. Relative archive paths
+#   # resolve against the clone the suite runs from. The controller and
+#   # capi-provisioned tags are their -e2e.versions keys, so they take none
+#   # here.
+#   images:
+#     controller:
+#       repository: ghcr.io/dsx-ai-factory/nvke/nvke-controller   # or nvcr.io/<org>/nvke-controller
+#       archive: ~/.cache/nke-e2e/site/controller.tar
+#     capi-provisioned:
+#       repository: ghcr.io/dsx-ai-factory/nvke/cluster-api-provider-provisioned
+#       archive: ~/.cache/nke-e2e/site/capi-provisioned.tar
+#     profiles:       # built from controller/test/fixtures, published nowhere
+#       repository: nke-e2e-profiles
+#       tag: local
+#       archive: ~/.cache/nke-e2e/site/profiles.tar
+
+# What the machine running the suite supplies, rather than anything about the
+# site it reaches — which is why this is not under `site`.
+# runner:
+#   teleportIdentityFile: ""   # "" -> $TELEPORT_IDENTITY_FILE, else the runner's tsh profile
+#   (the Teleport proxy comes from $TELEPORT_PROXY or the tsh login profile)
+
+# The CLI the bootstrap runs on the node.
+# nvkectl:
+#   binary: ""   # "" -> cli/dist/nvkectl-linux-<arch>, which `make site-inputs`
+#                #       builds. With SITE_CLI_BUILD=0 it fetches a published
+#                #       one to <SITE_INPUTS>/nvkectl/nvkectl-linux-<arch>, so
+#                #       point this there.

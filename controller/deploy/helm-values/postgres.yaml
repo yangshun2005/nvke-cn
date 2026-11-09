@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+auth:
+  username: postgres
+  # password is supplied by the Tiltfile from CNPG_SUPERUSER_PASSWORD — do not
+  # hardcode it here.
+  database: postgres
+
+primary:
+  persistence:
+    enabled: true
+    size: 1Gi
+  resources:
+    limits:
+      memory: 512Mi
+    requests:
+      memory: 256Mi
+  initdb:
+    scripts:
+      init-cwe.sql: |
+        CREATE DATABASE "nvke-controller";
+      init-temporal.sql: |
+        CREATE DATABASE temporal;
+        CREATE DATABASE temporal_visibility;

@@ -1,0 +1,265 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Reports Go dependency vulnerabilities that this code actually calls. Results
+# go to Security -> Code scanning under a "govulncheck-<module>" category.
+#
+# Every module in the workspace is scanned. It used to be agent/ alone, because
+# controller/ required the carbide SDK and could not build on a public runner.
+# #76 replaced that SDK with the public ncx-infra-controller-rest, so the whole
+# workspace builds from public dependencies and the exclusion no longer has a
+# reason. The build and the lint were widened; this was the piece left behind,
+# which meant the majority of the repository was compiled, linted and never
+# scanned.
+#
+# The matrix comes from go.work rather than a list kept here. A module added to
+# the workspace is scanned without anyone remembering to edit this file -- the
+# failure mode of a hand-kept list is silence, not an error.
+#
+# This job gates, but only on the narrow question.
+#
+# In SARIF mode govulncheck exits 0 whether or not it finds anything, and that
+# SARIF carries everything it can see, including packages that are only
+# imported. Gating on all of it would bury a new regression in a backlog. So the
+# upload still reports everything, and a separate step asks the smaller question
+# -- does this code CALL a vulnerable symbol? govulncheck exits 3 for that, 0
+# when clean.
+#
+# That set was zero for six of the seven modules present on 2026-08-13. The
+# matrix now also discovers the imported nvkectl module. It is also the set that
+# matters.
+# GO-2026-6061 was reachable from cmd/agent/main.go through
+# agent.startSecureServer to grpc.Server.Serve, and it reached main behind a
+# green check because this job reported it without failing on it. See #89.
+#
+# GOVULNCHECK_WAIVED is empty. Nothing is waived. controller/nico-sim was, for
+# GO-2026-4736 on gobgp v3, until it moved to gobgp v4: the advisory restricts
+# the v4 entry to pkg/server, and nico-sim imports only pkg/packet/bgp, so the
+# symbol is no longer called.
+#
+# A waiver is scoped to the advisory rather than the module, as
+# <module>=<OSV-id>, so a second, unrelated reachable vulnerability in that
+# module still fails the gate -- which a module-wide waiver would have hidden --
+# and a waived advisory that stops being called fails and asks to be un-waived.
+# An exclusion nobody is forced to revisit is how the previous single-module
+# scope survived long after the dependency that justified it was gone.
+#
+# GOVULNCHECK_WAIVER_REVIEW warns past its date rather than failing. A date that
+# broke the build would get the whole mechanism deleted the first time it fired;
+# the un-waive check is what actually stops rot.
+#
+# The gate runs after the upload so that a failure still leaves the findings in
+# the Security tab rather than losing them with the job.
+#
+# The workspace stays ON, unlike the previous single-module version of this
+# file. The Go module cache and go.sum supply public dependencies, so the scan measures
+# exactly what `make build` compiles. It is also why go-version is pinned rather
+# than read from a go.mod -- see the comment on that step.
+
+name: govulncheck
+
+# Nothing here needs an NVIDIA runner: the whole workspace resolves from the
+# public module graph, so merge-gate.yml calls this on the real pull_request
+# event, including fork and Dependabot pull requests. The standalone push
+# trigger is post-merge coverage on main; naming the mirrored PR branches here
+# too would run the same scan a second time.
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Daily 06:30 UTC. New advisories land without the code changing, and the
+    # only other trigger is the next push to main, which pins the red on
+    # whoever merged next.
+    - cron: '30 6 * * *'
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started. Five merges in
+  # three minutes cancelled 18 runs across 7 workflows this way, leaving
+  # three consecutive commits on main with no test result at all.
+  #
+  # Pull-request branches keep sharing a group and still cancel, which is
+  # what you want there.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so any workflow merge-gate.yml calls would
+  # share a group with its siblings and cancel them. 8 of 9 calls died that way,
+  # reported as failures with no jobs and no error message.
+  group: govulncheck-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  GOPROXY: https://proxy.golang.org|direct
+
+jobs:
+  discover-modules:
+    name: Discover workspace modules
+    runs-on: ubuntu-latest
+    # Same as license.yml's discover-modules, which does the same work.
+    timeout-minutes: 5
+    if: github.repository_id == '1323115536'
+    outputs:
+      modules: ${{ steps.find.outputs.modules }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the module list from go.work
+        id: find
+        shell: bash
+        run: |
+          set -euo pipefail
+          mods="$(./hack/workspace-modules.sh)"
+
+          # id is the category suffix and the job name: SARIF categories must be
+          # distinct or each upload overwrites the last, which would silently
+          # leave only one module's findings in the Security tab.
+          json=$(printf '%s\n' "$mods" \
+            | jq -R '{dir: ., id: (. | gsub("/"; "-"))}' \
+            | jq -sc .)
+
+          echo "modules=$json" >> "$GITHUB_OUTPUT"
+          echo "Scanning $(printf '%s\n' "$mods" | wc -l) modules:"
+          printf '%s\n' "$mods" | sed 's/^/  /'
+
+  govulncheck:
+    name: govulncheck (${{ matrix.module.dir }})
+    needs: [discover-modules]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read          # upload-sarif reads the workflow run
+      security-events: write
+    strategy:
+      # One vulnerable module must not hide the state of the others.
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.discover-modules.outputs.modules) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Read the pin from make/versions.mk rather than repeating it here. It was
+      # written in this file and in codeql.yml and nowhere a developer could
+      # reach it, so `make govulncheck` locally could not match this job.
+      - name: Read pinned versions
+        id: versions
+        run: |
+          {
+            echo "go=$(make --no-print-directory print-GOVULNCHECK_GO_VERSION)"
+            echo "tool=$(make --no-print-directory print-GOVULNCHECK_VERSION)"
+            echo "waived=$(make --no-print-directory print-GOVULNCHECK_WAIVED)"
+            echo "waiver_owner=$(make --no-print-directory print-GOVULNCHECK_WAIVER_OWNER)"
+            echo "waiver_review=$(make --no-print-directory print-GOVULNCHECK_WAIVER_REVIEW)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Pin the version the Dockerfiles build with, so the scan reports on
+          # the toolchain we ship. Not go-version-file: a go directive is a
+          # floor, so it scans the oldest Go allowed -- and this workspace's
+          # floors range from 1.25.4 to 1.26.5, which would give nine modules
+          # five different answers to the same question. Not `stable`: setup-go
+          # resolves it from GitHub's manifest, which lags, so it can be older
+          # than what we ship. Keep this in step with the Dockerfiles.
+          #
+          # This is not cosmetic. On 2026-08-13 the same controller/ tree
+          # reported 7 reachable standard-library vulnerabilities under 1.26.5
+          # and 0 under 1.26.6.
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+          # go.work.sum holds only the hashes NOT already in a member's go.sum,
+          # so the versions actually linked often appear in it zero times. Keyed
+          # on it alone, a dependency bump leaves the key unchanged and restores
+          # a stale cache. Same block as go-build.yml, plus the module's go.mod
+          # so each matrix job keys its own cache instead of the first finisher's.
+          cache-dependency-path: |
+            go.work.sum
+            **/go.sum
+            ${{ matrix.module.dir }}/go.mod
+
+      - name: Install govulncheck
+        # golang.org/x/vuln v1.6.0 needs go >= 1.25.0, which the pin above
+        # satisfies, so this needs no GOTOOLCHAIN=auto.
+        #
+        # This fetches the tool independently. `go install pkg@version`
+        # ignores the surrounding workspace, so it resolves the tool's own
+        # dependencies rather than the repository's build list.
+        run: go install golang.org/x/vuln/cmd/govulncheck@${{ steps.versions.outputs.tool }}
+
+      - name: Run govulncheck
+        id: scan
+        shell: bash
+        working-directory: ${{ matrix.module.dir }}
+        run: |
+          set -euo pipefail
+          raw="${RUNNER_TEMP}/govulncheck.raw.sarif"
+          out="${RUNNER_TEMP}/govulncheck.sarif"
+          govulncheck -format sarif ./... > "${raw}"
+          # Fail loudly rather than skip the upload and report a green check.
+          if [ ! -s "${raw}" ]; then
+            echo "::error::govulncheck produced no SARIF at ${raw}"
+            exit 1
+          fi
+          # GitHub validates SARIF with uniqueItems on properties.tags, and
+          # govulncheck can list the same CVE alias twice on one rule, which
+          # gets the whole upload rejected as invalid. Only reachable when
+          # there are findings, which is why the one clean repository in the
+          # fleet never hit it.
+          jq '(.runs[]?.tool?.driver?.rules[]?.properties?.tags) |= unique' \
+            "${raw}" > "${out}"
+          echo "sarif=${out}" >> "${GITHUB_OUTPUT}"
+
+      - name: Summarise
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="${RUNNER_TEMP}/govulncheck.sarif"
+          {
+            echo "## govulncheck — module \`${{ matrix.module.dir }}\`"
+            echo
+            if [ ! -s "${f}" ]; then
+              echo "No SARIF produced. The scan did not finish."
+            else
+              echo "$(jq '[.runs[].results[]] | length' "${f}") result(s). Details in **Security -> Code scanning**, category \`govulncheck-${{ matrix.module.id }}\`."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload SARIF
+        # Guarded on a step output, not hashFiles(): hashFiles() only resolves
+        # paths under GITHUB_WORKSPACE, so against RUNNER_TEMP it silently
+        # returns '' and skips the upload while the job still reports green.
+        if: always() && steps.scan.outputs.sarif != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+          checkout_path: ${{ github.workspace }}/${{ matrix.module.dir }}
+          category: govulncheck-${{ matrix.module.id }}
+
+      - name: Fail on a reachable vulnerability
+        # Runs last on purpose: the SARIF upload above must happen even when
+        # this fails, or a red check would also lose the findings.
+        #
+        # A second scan rather than a re-read of the SARIF, because the SARIF
+        # does not separate "imported" from "called". The module cache is warm
+        # from the first run, so this is cheap.
+        #
+        # Exit 3 is a called vulnerability, 0 is clean, anything else is the
+        # tool failing.
+        shell: bash
+        env:
+          GOVULNCHECK_WAIVED: ${{ steps.versions.outputs.waived }}
+          GOVULNCHECK_WAIVER_OWNER: ${{ steps.versions.outputs.waiver_owner }}
+          GOVULNCHECK_WAIVER_REVIEW: ${{ steps.versions.outputs.waiver_review }}
+        run: ./hack/govulncheck-gate.sh "${{ matrix.module.dir }}"

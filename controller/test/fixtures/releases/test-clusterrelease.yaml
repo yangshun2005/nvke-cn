@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: internal.nvke.nvidia.com/v1
+kind: ClusterRelease
+metadata:
+  name: test
+  annotations:
+    internal.nvke.nvidia.com/machine-init-kubernetes-version: "1.30.0"
+    internal.nvke.nvidia.com/machine-init-kubernetes-version-injected: "false"
+spec:
+  machineImageRef:
+    name: test
+  machineInit:
+    userDataTemplate: |
+      #cloud-config
+      hostname: {{ .Hostname }}
+      preserve_hostname: false
+      package_update: true
+      package_upgrade: false
+
+      {{ if .Files }}
+      write_files:
+      {{ range .Files }}
+        - path: {{ quote .Path }}
+          owner: {{ quote .Owner }}
+          permissions: {{ quote .Permissions }}
+      {{ if .Encoding }}
+          encoding: {{ quote .Encoding }}
+      {{ end }}
+          content: {{ quote .Content }}
+      {{ end }}
+      {{ else }}
+      write_files: []
+      {{ end }}
+      runcmd:
+        - DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=600 nvke-agent=0.1.26 nvke-kubeadm-distro-{{ trimPrefix .KubernetesVersion "v" }} spire-agent
+        - DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=600 {{ .CNIImagePackage }} {{ .CNIChartsPackage }}
+        - touch /run/cloud-init.done
+  lifecycle:
+    deprecated: false
+    hidden: false

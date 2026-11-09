@@ -1,0 +1,365 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package nvkecontroller adapts the existing NVKE controller cluster API for reconciliation.
+// This will be removed with the migration to CAPI.
+package nvkecontroller
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	api "github.com/dsx-ai-factory/nvke/controller/api"
+)
+
+const maxResponseBytes = 1 << 20
+
+var (
+	// ErrNotFound means the requested cluster does not exist.
+	ErrNotFound = errors.New("NVKE controller cluster not found")
+	// ErrInvalidResponse means a successful response cannot identify the requested cluster.
+	ErrInvalidResponse = errors.New("NVKE controller returned an invalid cluster response")
+)
+
+// HTTPError reports a rejected request with its status and structured API message.
+type HTTPError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *HTTPError) Error() string {
+	message := fmt.Sprintf("NVKE controller request returned HTTP %d", e.StatusCode)
+	if e.Message != "" {
+		message += ": " + e.Message
+	}
+	return message
+}
+
+// Config selects the operator-controlled NVKE controller endpoint and optional bearer token file.
+type Config struct {
+	Endpoint  string
+	TokenFile string
+}
+
+// Client validates cluster identity and redacts failures from generated NVKE controller requests.
+type Client struct {
+	api *api.Client
+}
+
+// New constructs a client with bounded requests, verified TLS and no redirects.
+func New(cfg Config) (*Client, error) {
+	endpoint, err := normalizeEndpoint(cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.TokenFile != "" {
+		if _, err := readToken(cfg.TokenFile); err != nil {
+			return nil, err
+		}
+	}
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	raw, err := api.NewClient(endpoint, api.WithHTTPClient(httpClient), api.WithRequestEditorFn(
+		func(_ context.Context, req *http.Request) error {
+			if cfg.TokenFile == "" {
+				return nil
+			}
+			// Reload projected tokens so credential rotation does not require a restart.
+			token, err := readToken(cfg.TokenFile)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			return nil
+		},
+	))
+	if err != nil {
+		return nil, errors.New("could not construct NVKE controller API client")
+	}
+	return &Client{api: raw}, nil
+}
+
+// FindByName finds a single exact-name match. It does not establish ownership.
+func (c *Client) FindByName(ctx context.Context, name string) (*api.Cluster, error) {
+	if name == "" {
+		return nil, errors.New("NVKE controller cluster name is required")
+	}
+	response, err := c.api.ListClusters(ctx, &api.ListClustersParams{Name: &name})
+	var result api.ListClustersResponse
+	if err := readResponse(response, err, http.StatusOK, &result); err != nil {
+		return nil, err
+	}
+	if result.Clusters == nil {
+		return nil, ErrInvalidResponse
+	}
+	if len(result.Clusters) == 0 {
+		return nil, ErrNotFound
+	}
+	if len(result.Clusters) != 1 || result.Clusters[0].Name != name || result.Clusters[0].ID == uuid.Nil {
+		return nil, ErrInvalidResponse
+	}
+	return &result.Clusters[0], nil
+}
+
+// Get reads the cluster with the given server-assigned UUID.
+func (c *Client) Get(ctx context.Context, id string) (*api.Cluster, error) {
+	clusterID, err := parseID(id)
+	if err != nil {
+		return nil, err
+	}
+	response, err := c.api.GetCluster(ctx, clusterID)
+	var result api.Cluster
+	if err := readResponse(response, err, http.StatusOK, &result); err != nil {
+		return nil, err
+	}
+	if result.ID != clusterID || result.Name == "" {
+		return nil, ErrInvalidResponse
+	}
+	return &result, nil
+}
+
+// Create submits the existing NVKE controller request. Callers must persist intent before calling it.
+func (c *Client) Create(ctx context.Context, request api.CreateClusterRequest) (*api.Cluster, error) {
+	if request.Name == "" {
+		return nil, errors.New("NVKE controller cluster name is required")
+	}
+	response, err := c.api.CreateCluster(ctx, request)
+	var result api.Cluster
+	if err := readResponse(response, err, http.StatusCreated, &result); err != nil {
+		return nil, err
+	}
+	if result.ID == uuid.Nil || result.Name != request.Name {
+		return nil, ErrInvalidResponse
+	}
+	return &result, nil
+}
+
+// Update patches cluster configuration and validates the returned cluster identity.
+func (c *Client) Update(ctx context.Context, id string, request api.UpdateClusterRequest) (*api.Cluster, error) {
+	clusterID, err := parseID(id)
+	if err != nil {
+		return nil, err
+	}
+	body, err := marshalClusterUpdate(request)
+	if err != nil {
+		return nil, fmt.Errorf("encode NVKE controller cluster update: %w", err)
+	}
+	response, err := c.api.UpdateClusterWithBody(ctx, clusterID, "application/json", bytes.NewReader(body))
+	var result api.Cluster
+	if err := readResponse(response, err, http.StatusOK, &result); err != nil {
+		return nil, err
+	}
+	if result.ID != clusterID || result.Name == "" {
+		return nil, ErrInvalidResponse
+	}
+	return &result, nil
+}
+
+func marshalClusterUpdate(request api.UpdateClusterRequest) ([]byte, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	if request.ControlPlaneConfig == nil || request.ControlPlaneConfig.Infra == nil {
+		return body, nil
+	}
+	var fields map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&fields); err != nil {
+		return nil, err
+	}
+	config := fields["controlPlaneConfig"].(map[string]any)
+	infra := config["infra"].(map[string]any)
+	requested := request.ControlPlaneConfig.Infra
+	// Generated omitempty tags drop empty collections that PATCH needs to clear stored values.
+	if requested.BootstrapFiles != nil {
+		infra["bootstrapFiles"] = requested.BootstrapFiles
+	}
+	if requested.MachineTemplate != nil {
+		infra["machineTemplate"] = requested.MachineTemplate
+	}
+	if requested.PreKubeadmCommands != nil {
+		infra["preKubeadmCommands"] = requested.PreKubeadmCommands
+	}
+	return json.Marshal(fields)
+}
+
+// Delete requests asynchronous deletion
+func (c *Client) Delete(ctx context.Context, id string) error {
+	clusterID, err := parseID(id)
+	if err != nil {
+		return err
+	}
+	response, err := c.api.DeleteCluster(ctx, clusterID)
+	err = readResponse(response, err, http.StatusAccepted, nil)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
+// FindNodePool finds a worker pool by its exact name within the named cluster.
+func (c *Client) FindNodePool(ctx context.Context, clusterName, name string) (*api.NodePool, error) {
+	if clusterName == "" || name == "" {
+		return nil, errors.New("NVKE controller cluster and node pool names are required")
+	}
+	response, err := c.api.ListNodePools(ctx, &api.ListNodePoolsParams{ClusterName: &clusterName, Name: &name})
+	var result api.ListNodePoolsResponse
+	if err := readResponse(response, err, http.StatusOK, &result); err != nil {
+		return nil, err
+	}
+	if result.NodePools == nil {
+		return nil, ErrInvalidResponse
+	}
+	if len(result.NodePools) == 0 {
+		return nil, ErrNotFound
+	}
+	if len(result.NodePools) != 1 {
+		return nil, ErrInvalidResponse
+	}
+	pool := result.NodePools[0]
+	if pool.ID == uuid.Nil || pool.ClusterID == uuid.Nil || pool.Name != name || pool.ControlPlane {
+		return nil, ErrInvalidResponse
+	}
+	return &pool, nil
+}
+
+// CreateNodePool creates a worker pool and validates its returned identity.
+func (c *Client) CreateNodePool(ctx context.Context, request api.CreateNodePoolRequest) (*api.NodePool, error) {
+	if request.ClusterID == uuid.Nil || request.Name == "" {
+		return nil, errors.New("NVKE controller cluster ID and node pool name are required")
+	}
+	response, err := c.api.CreateNodePool(ctx, request)
+	var result api.NodePool
+	if err := readResponse(response, err, http.StatusCreated, &result); err != nil {
+		return nil, err
+	}
+	if result.ID == uuid.Nil || result.ClusterID != request.ClusterID || result.Name != request.Name || result.ControlPlane {
+		return nil, ErrInvalidResponse
+	}
+	return &result, nil
+}
+
+// UpdateNodePool patches the supplied fields on a worker pool and validates its returned identity.
+func (c *Client) UpdateNodePool(ctx context.Context, id string, request api.UpdateNodePoolRequest) (*api.NodePool, error) {
+	nodePoolID, err := parseNodePoolID(id)
+	if err != nil {
+		return nil, err
+	}
+	response, err := c.api.UpdateNodePool(ctx, nodePoolID, request)
+	var result api.NodePool
+	if err := readResponse(response, err, http.StatusOK, &result); err != nil {
+		return nil, err
+	}
+	if result.ID != nodePoolID || result.ClusterID == uuid.Nil || result.Name == "" || result.ControlPlane {
+		return nil, ErrInvalidResponse
+	}
+	return &result, nil
+}
+
+func (c *Client) DeleteNodePool(ctx context.Context, id string) error {
+	nodePoolID, err := parseNodePoolID(id)
+	if err != nil {
+		return err
+	}
+	response, err := c.api.DeleteNodePool(ctx, nodePoolID)
+	err = readResponse(response, err, http.StatusAccepted, nil)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
+func readResponse(response *http.Response, requestErr error, expected int, target any) error {
+	if requestErr != nil {
+		if errors.Is(requestErr, context.Canceled) {
+			return fmt.Errorf("NVKE controller request canceled: %w", context.Canceled)
+		}
+		if errors.Is(requestErr, context.DeadlineExceeded) {
+			return fmt.Errorf("NVKE controller request timed out: %w", context.DeadlineExceeded)
+		}
+		return errors.New("NVKE controller request failed before a response was received")
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusNotFound {
+		return ErrNotFound
+	}
+	if response.StatusCode != expected {
+		responseErr := &HTTPError{StatusCode: response.StatusCode}
+		var detail api.GenericError
+		if err := json.NewDecoder(response.Body).Decode(&detail); err == nil {
+			responseErr.Message = strings.TrimSpace(detail.Message)
+		}
+		return responseErr
+	}
+	if target == nil {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	if err != nil || len(body) > maxResponseBytes || json.Unmarshal(body, target) != nil {
+		return ErrInvalidResponse
+	}
+	return nil
+}
+
+func parseID(id string) (uuid.UUID, error) {
+	parsed, err := uuid.Parse(id)
+	if err != nil || parsed == uuid.Nil {
+		return uuid.Nil, errors.New("NVKE controller cluster ID must be a nonzero UUID")
+	}
+	return parsed, nil
+}
+
+func parseNodePoolID(id string) (uuid.UUID, error) {
+	parsed, err := uuid.Parse(id)
+	if err != nil || parsed == uuid.Nil {
+		return uuid.Nil, errors.New("NVKE controller node pool ID must be a nonzero UUID")
+	}
+	return parsed, nil
+}
+
+func readToken(filename string) (string, error) {
+	contents, err := os.ReadFile(filename)
+	if err != nil {
+		return "", errors.New("could not read NVKE controller bearer token file")
+	}
+	token := strings.TrimSpace(string(contents))
+	if token == "" || strings.ContainsAny(token, " \t\r\n") {
+		return "", errors.New("NVKE controller bearer token file is empty or malformed")
+	}
+	return token, nil
+}
+
+func normalizeEndpoint(endpoint string) (string, error) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", errors.New("NVKE controller endpoint must be an absolute HTTP(S) URL without credentials, query or fragment")
+	}
+	parsed.Path = strings.TrimRight(path.Clean(parsed.Path), "/")
+	if parsed.Path == "." {
+		parsed.Path = ""
+	}
+	if !strings.HasSuffix(parsed.Path, "/api") {
+		parsed.Path += "/api"
+	}
+	parsed.RawPath = ""
+	return parsed.String(), nil
+}

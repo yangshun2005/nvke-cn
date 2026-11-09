@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Lint
+
+# Nothing here needs an NVIDIA runner: the whole workspace resolves from the
+# public module graph, so merge-gate.yml calls this on the real pull_request
+# event, including fork and Dependabot pull requests. The standalone push
+# trigger is post-merge coverage on main; naming the mirrored PR branches here
+# too would run the same lint jobs a second time.
+on:
+  push:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: Lint-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  GOWORK: "off"
+  GOPROXY: https://proxy.golang.org|direct
+
+jobs:
+  lint:
+    name: golangci-lint (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      contents: read
+    env:
+      GOWORK: ${{ matrix.gowork }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: controller
+            dir: controller
+            goversion: go.work
+            gowork: ""
+            timeout: 25
+          - name: controller/api
+            dir: controller/api
+            goversion: go.work
+            gowork: ""
+            timeout: 15
+          - name: controller/deploy/charts
+            dir: controller/deploy/charts
+            goversion: go.work
+            gowork: ""
+            timeout: 15
+          - name: auth
+            dir: auth
+            goversion: go.work
+            gowork: ""
+            timeout: 15
+          - name: provisioned-provider
+            dir: cluster-api-provider-provisioned
+            goversion: cluster-api-provider-provisioned/go.mod
+            gowork: "off"
+            timeout: 15
+          - name: agent
+            dir: agent
+            goversion: agent/go.mod
+            gowork: "off"
+            timeout: 15
+          - name: cli
+            dir: cli
+            goversion: cli/go.mod
+            gowork: "off"
+            timeout: 15
+          - name: nico-sim
+            dir: controller/nico-sim
+            goversion: controller/nico-sim/go.mod
+            gowork: "off"
+            timeout: 15
+          - name: controller/test/e2e
+            dir: controller/test/e2e
+            goversion: controller/test/e2e/go.mod
+            gowork: "off"
+            timeout: 15
+          - name: capd-reboot-controller
+            dir: controller/hack/capd-reboot-controller
+            goversion: go.work
+            gowork: ""
+            timeout: 15
+          - name: management-engine
+            dir: management-engine
+            goversion: go.work
+            gowork: ""
+            timeout: 15
+          - name: os-image
+            dir: os-image
+            goversion: os-image/go.mod
+            gowork: "off"
+            timeout: 15
+          - name: release
+            dir: release
+            goversion: release/go.mod
+            gowork: "off"
+            timeout: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ matrix.goversion }}
+          cache: true
+          # The module's go.mod makes the key its own: one shared key let the first job to finish save
+          # the cache for all twelve, and a 1.8 GB save by a heavy one filled the controller/api job's disk.
+          cache-dependency-path: |
+            go.work.sum
+            **/go.sum
+            ${{ matrix.dir }}/go.mod
+
+      - name: Run golangci-lint
+        working-directory: ${{ matrix.dir }}
+        run: make lint

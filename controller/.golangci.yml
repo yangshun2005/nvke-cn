@@ -1,0 +1,356 @@
+# // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# // SPDX-License-Identifier: Apache-2.0
+
+version: "2"
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/dsx-ai-factory/nvke/controller
+    gofumpt:
+      extra-rules: true
+
+run:
+  timeout: 5m
+  allow-parallel-runners: true
+  concurrency: 8
+  go: ""
+  # Dependencies resolve from public Go modules. Do not update manifests as
+  # a side effect of linting; work-check verifies them separately.
+  modules-download-mode: readonly
+
+output:
+  print-issued-lines: false
+  print-linter-name: true
+  sort-results: true
+
+linters:
+  default: none
+  disable:
+    # In many situations this looks weird.
+    - nlreturn
+    # Do not enforce dedicated test packages.
+    - testpackage
+    - wrapcheck
+  enable:
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - containedctx
+    - contextcheck
+    - copyloopvar
+    - decorder
+    - depguard
+    - dogsled
+    - dupword
+    - durationcheck
+    - errcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - exhaustive
+    - exhaustruct
+    - forbidigo
+    - forcetypeassert
+    - funlen
+    - ginkgolinter
+    - gocheckcompilerdirectives
+    - gochecknoglobals
+    - gochecksumtype
+    - goconst
+    - gocritic
+    - godox
+    - goheader
+    - gomoddirectives
+    - gomodguard_v2
+    - goprintffuncname
+    - gosec
+    - gosmopolitan
+    - govet
+    - grouper
+    - importas
+    - inamedparam
+    - ineffassign
+    - interfacebloat
+    - intrange
+    - loggercheck
+    - maintidx
+    - makezero
+    - mirror
+    - misspell
+    - musttag
+    - nakedret
+    - nilnil
+    - noctx
+    - nolintlint
+    - nonamedreturns
+    - prealloc
+    - predeclared
+    - promlinter
+    - protogetter
+    - reassign
+    - revive
+    - rowserrcheck
+    - sloglint
+    - spancheck
+    - sqlclosecheck
+    - staticcheck
+    - testableexamples
+    - testifylint
+    - thelper
+    - tparallel
+    - unconvert
+    - unparam
+    - unused
+    - usestdlibvars
+    - varnamelen
+    - wastedassign
+    - whitespace
+    - zerologlint
+
+  settings:
+    gomoddirectives:
+      replace-local: true
+      replace-allow-list:
+        # Pins the stub monolithic genproto so it cannot collide with the
+        # genproto/googleapis/* split modules in the workspace build list; see
+        # the comment on the replace directive in go.mod.
+        - google.golang.org/genproto
+        - sigs.k8s.io/controller-runtime
+    cyclop:
+      max-complexity: 15
+    depguard:
+      rules:
+        main:
+          list-mode: lax
+          files:
+            - $all
+          deny:
+            - pkg: github.com/pkg/errors
+              desc: "use stdlib instead"
+    forbidigo:
+      forbid:
+        - pattern: '^(fmt\.Print(|f|ln)|print|println)$'
+        - pattern: db\.NewDB
+          msg: use dbwrapper.New(db.NewDB(...)) in the composition root and pass *dbwrapper.DB to DB-backed reconcilers
+    funlen:
+      # cmd/worker's main() is a wiring function: it grows by a block every time
+      # a subsystem is added, and no single addition is the one at fault. It
+      # crossed 500 when the authentication setup and the teleport token
+      # controller landed within a few days of each other, breaking lint on main
+      # for changes that had nothing to do with either.
+      lines: 600
+      statements: -1
+      # Let us devs write comments.
+      ignore-comments: true
+    goconst:
+      min-len: 4
+      # Well-known Kubernetes / YAML literals. Repeating these is the API, not a
+      # missed constant.
+      ignore-string-values:
+        - '^Cluster$'
+        - '^DaemonSet$'
+        - '^Machine$'
+        - '^NicoMachine$'
+        - '^Secret$'
+        - '^etcd$'
+        - '^kube-system$'
+        - '^root:root$'
+        - '^true$'
+        - '^v1$'
+        - '^value$'
+    gocritic:
+      enable-all: true
+      disabled-checks:
+        - rangeValCopy
+        - hugeParam
+        - exitAfterDefer
+        - unnamedResult
+        - paramTypeCombine
+    gocyclo:
+      min-complexity: 15
+    godox:
+      # Use TODO: to cause a lint error for things that should be done before merging.
+      # Use FIXME: to indicate things that should be done in a future MR.
+      # Example: FIXME: short description of deferred work
+      keywords:
+        - TODO
+    goheader:
+      template: |-
+        SPDX-FileCopyrightText: Copyright (c) {{MOD_YEAR-RANGE}} NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+        SPDX-License-Identifier: Apache-2.0
+    goimports:
+      # Might need customization per project
+      local-prefixes:
+        - github.com/dsx-ai-factory/nvke/controller
+    govet:
+      enable-all: true
+      disable:
+        # it is usually better to group fields to make them understandable than saving bytes.
+        - fieldalignment
+    grouper:
+      const-require-grouping: true
+      import-require-grouping: true
+      var-require-grouping: false
+      var-require-single-var: true
+    misspell:
+      locale: US
+    tagalign:
+      align: false
+      # Sorting tags can enhance readability for elements grouped in the same structure, but might
+      # also be a pain for certain cases.
+      sort: true
+      strict: true
+      order:
+        # Make Kong tags happy.
+        - embed
+        - help
+        - name
+        - prefix
+        - envprefix
+        - enum
+        - env
+        - default
+    revive:
+      ignore-generated-header: true
+    varnamelen:
+      min-name-length: 1
+    wsl:
+      allow-assign-and-call: true
+      allow-assign-and-anything: true
+      # Some kubebuilder comments might need this.
+      allow-trailing-comment: false
+      allow-cuddle-declarations: true
+    exhaustruct:
+      # Ignore everything by default, enable where desired
+      exclude:
+        - '.*'
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # OSRB requires the original Kubernetes notice to come first in the files
+      # copied from Kubernetes, so the NVIDIA header cannot be their first comment.
+      - path: 'internal/kubeadmconfig/thirdparty/'
+        linters:
+          - goheader
+      # The Go-workspace version unification moved controller-runtime to
+      # v0.24, which deprecates the client.Apply patch type in favour of
+      # client.Client.Apply(). The ~24 call sites across the module still
+      # work; migrating them is real apply-semantics work tracked separately
+      # from the workspace change. Remove this rule with that migration.
+      - linters:
+          - staticcheck
+        text: 'client\.Apply is deprecated'
+      - path: '(.+)_test\.go'
+        linters:
+          - gochecknoglobals
+          - grouper
+          - gosec
+          - wrapcheck
+          - wsl
+          - goconst
+          - forcetypeassert
+          - gocyclo
+          - maintidx
+      - path: 'internal/temporal/workflows/.*'
+        linters:
+          # Temporal workflows use defer to check for errors, and it looks
+          # better a named returned parameter than other patterns.
+          - nakedret
+          - nonamedreturns
+      - text: 'shadow: declaration of "(err|ctx)" shadows declaration at'
+        linters:
+          - govet
+      # Allow unused ctx parameters - common in handlers/callbacks that must match interface signatures
+      - text: 'unused-parameter.*ctx'
+        linters:
+          - revive
+      # db.NewDB is allowed where the process creates the database handle before
+      # immediately wrapping it, and in test/e2e setup code that seeds local DBs.
+      - path: 'cmd/worker/main\.go'
+        text: 'use dbwrapper\.New'
+        linters:
+          - forbidigo
+      - path: '(.+)_test\.go'
+        text: 'use dbwrapper\.New'
+        linters:
+          - forbidigo
+      - path: 'e2e/framework/.*'
+        text: 'use dbwrapper\.New'
+        linters:
+          - forbidigo
+      # Allow unused req parameters - common in API handlers
+      - text: 'unused-parameter.*req'
+        linters:
+          - revive
+      # Allow unused r (*http.Request) parameters - common in HTTP handlers
+      - text: 'unused-parameter.*\br\b'
+        linters:
+          - revive
+      # Allow unexported return types - internal implementation pattern
+      - text: 'unexported-return'
+        linters:
+          - revive
+      # Allow context not being first param in test helpers where *testing.T comes first
+      - path: '(.+)_test\.go'
+        text: 'context-as-argument'
+        linters:
+          - revive
+      # Allow import shadowing for common patterns like db, uuid
+      - text: 'importShadow'
+        linters:
+          - gocritic
+      # Migrations use required callback signatures
+      - path: 'internal/db/migrations/.*'
+        linters:
+          - revive
+      # Allow var-naming for generated API package
+      - path: 'api/.*'
+        text: 'var-naming'
+        linters:
+          - revive
+      # Allow var-naming for utils package
+      - path: 'internal/utils/.*'
+        text: 'var-naming'
+        linters:
+          - revive
+      # Allow stutter in the internal/rollout framework's established public API
+      # names. These are ported ~verbatim from the battle-tested SWE rollout
+      # engine and are used across the whole rollout stack (adapters, temporal,
+      # operations); the Rollout-prefixed names read clearer at cross-package
+      # call sites (e.g. rollout.RolloutSpec/RolloutError vs bare Spec/Error).
+      - text: 'type name will be used as rollout\.Rollout(Spec|Strategy|Error)'
+        linters:
+          - revive
+      - text: 'type name will be used as (dryrun\.DryRunOperation|kubevip\.KubeVipDrainRestoreGuard)'
+        linters:
+          - revive
+      # Allow unused orgID/siteID in test mock functions
+      - path: '(.+)_test\.go'
+        text: 'unused-parameter.*(orgID|siteID)'
+        linters:
+          - revive
+      # QF1008: embedded field selector style - keep explicit for clarity
+      - text: 'QF1008'
+        linters:
+          - staticcheck
+      # QF1006: lift into loop condition - current style is clearer
+      - text: 'QF1006'
+        linters:
+          - staticcheck
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

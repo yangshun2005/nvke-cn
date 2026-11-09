@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Install CRDs as part of the chart so we can apply our own Issuer/Certificate
+# resources right away. Single replica is plenty for tilt.
+crds:
+  enabled: true
+
+replicaCount: 1
+webhook:
+  replicaCount: 1
+cainjector:
+  replicaCount: 1

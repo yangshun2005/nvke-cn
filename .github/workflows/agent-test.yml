@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Unit-test lane for the agent module. Mirrors `make test` in agent/
+# (`go test ./...`) and only runs when agent (or this workflow) changes, so
+# unrelated monorepo PRs are not blocked by it.
+#
+# GitHub-hosted runners, not the self-hosted linux-*-cpu16 pool, deliberately.
+# This repository does not dispatch fork or Dependabot pull_request jobs to the
+# NVIDIA runner pool, so using it would cost that coverage. The agent module
+# resolves from public modules (workspace mode), so this needs
+# no NVIDIA runner and no credentials.
+#
+# Go Build already compiles the workspace; this job is the missing `go test`
+# half for agent/.
+
+name: Agent Unit Tests
+
+# workflow_call is what merge-gate.yml uses to call this as a reusable workflow.
+# Its own `pull_request:` trigger is gone: pull requests reach it through the
+# gate, so it runs once per pull request rather than twice.
+#
+# A called workflow does not apply its own `paths:` filter, so on a pull request
+# this runs whatever changed. That is deliberate -- see the note in
+# merge-gate.yml. The filter below still applies to `push`.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agent/**'
+      - 'go.work'
+      - 'go.work.sum'
+      - '.github/workflows/agent-test.yml'
+  workflow_call:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started. Five merges in
+  # three minutes cancelled 18 runs across 7 workflows this way, leaving
+  # three consecutive commits on main with no test result at all.
+  #
+  # Pull-request branches keep sharing a group and still cancel, which is
+  # what you want there.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so every workflow merge-gate.yml calls would
+  # compute the same group and cancel each other -- 8 of 9 calls died that way,
+  # reported to the gate as failures with no jobs and no error message.
+  group: Agent Unit Tests-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  # Do not cancel a run on main; the newer workflows here all guard this.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# A module fetch the proxy drops mid-stream falls back to the module's origin (#1481).
+env:
+  GOPROXY: https://proxy.golang.org|direct
+
+jobs:
+  test:
+    # Named for the module, matching controller-test.yml's
+    # `Unit tests (${{ matrix.module }})`. This is the only unqualified test
+    # check left, and branch protection matches a required check by job name --
+    # so an unqualified name is one workflow away from being ambiguous.
+    name: Unit tests (agent)
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Workspace mode (default) so tests resolve the root module graph.
+      # go.work carries the toolchain that satisfies every module.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            **/go.sum
+
+      # agent/.golangci.yml disables govet, so without this the privileged node
+      # daemon gets no vet anywhere in CI. Plain `go vet` is not the same check:
+      # golangci's govet runs `shadow` under enable-all, which is where the 41
+      # findings in that disable comment come from. This restores the standard
+      # analyzers now; re-enabling the linter still needs those triaged.
+      - name: Vet
+        working-directory: agent
+        run: make vet
+
+      # Same command as `make test`, with the race detector switched on through
+      # GO_TEST_FLAGS so the workflow does not have to restate what "the tests"
+      # are. This is the explicit follow-up the previous comment asked for.
+      #
+      # The agent runs goroutines around shared state -- pkg/auth ticks a token
+      # watcher that rewrites a field an interceptor reads -- so this is the
+      # module where -race has the most to find.
+      - name: Run unit tests
+        working-directory: agent
+        env:
+          GO_TEST_FLAGS: -race
+        run: make test

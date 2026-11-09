@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Mirror-branch pushes can contain base-branch updates as well as the pull
+# request changes. GitHub's push path filter then starts a lane for a pull
+# request that changes none of its inputs. Use the pull request file list as
+# the authoritative source before allocating a self-hosted runner.
+#
+# The filter matches that list against the calling lane's own on.push.paths,
+# read from the lane's workflow file at the pushed commit, so a lane keeps one
+# path list. Docs, Markdown and unit-test files never count as a lane input.
+# hack/e2e-path-filter.py holds the rules; `make lint-workflows` runs its tests
+# and fails when a self-hosted mirror lane with push paths does not call this.
+#
+# Callers grant the job `contents: read` (to read the lane's workflow file and
+# the script) and `pull-requests: read` (to list the pull request's files).
+
+name: E2E pull request path filter
+
+on:
+  workflow_call:
+    outputs:
+      run_e2e:
+        description: Whether the caller must run its E2E job.
+        value: ${{ jobs.filter.outputs.run_e2e }}
+
+permissions: {}
+
+jobs:
+  filter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run_e2e: ${{ steps.changed-files.outputs.run_e2e }}
+    steps:
+      # Only a push to a mirror branch is filtered. main, schedules and manual
+      # runs, a dispatch on a mirror branch included, start every lane they
+      # trigger, as their own path filters decide.
+      - name: Checkout the lane definitions and the filter
+        if: github.event_name == 'push' && startsWith(github.ref_name, 'pull-request/')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows
+            hack/e2e-path-filter.py
+          sparse-checkout-cone-mode: false
+
+      - name: Check pull request paths
+        id: changed-files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          # In a called workflow the github context is the caller's, so this
+          # names the lane's own workflow file.
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          run_e2e=true
+
+          if [[ "$EVENT_NAME" == push && "$REF_NAME" =~ ^pull-request/([0-9]+)$ ]]; then
+            pr_number="${BASH_REMATCH[1]}"
+            # The files endpoint stops at 3000 files; a longer pull request runs
+            # the lane rather than be judged on part of its list. Checked before
+            # the listing, so that case does not page through the files first.
+            total="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.changed_files')"
+            if (( total >= 3000 )); then
+              echo "Pull request ${pr_number} changes ${total} files, past the list limit: running the lane."
+              echo "run_e2e=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            changed_files="$(mktemp)"
+            # A rename lists both names: moving a lane input away changes the lane.
+            gh api --paginate \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/files?per_page=100" \
+              --jq '.[] | .filename, (.previous_filename // empty)' > "$changed_files"
+
+            # owner/repo/.github/workflows/<lane>.yml@refs/heads/pull-request/<n>
+            workflow="${WORKFLOW_REF#*/*/}"
+            workflow="${workflow%%@*}"
+            if [[ "$workflow" == .github/workflows/e2e-pr-path-filter.yml || ! -f "$workflow" ]]; then
+              echo "::error::Cannot name the calling lane from github.workflow_ref (${WORKFLOW_REF})."
+              exit 1
+            fi
+
+            run_e2e="$(python3 -B hack/e2e-path-filter.py decide \
+              --workflow "$workflow" --changed-files "$changed_files" --pull-request "$pr_number")"
+          fi
+
+          echo "run_e2e=${run_e2e}" >> "$GITHUB_OUTPUT"

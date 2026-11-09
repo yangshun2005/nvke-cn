@@ -1,0 +1,110 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package db_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/dsx-ai-factory/nvke/controller/internal/db"
+	"github.com/dsx-ai-factory/nvke/controller/internal/testutil"
+)
+
+func TestSyncMissingControlPlaneConfigsFromCPNodePools(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	bunDB := testutil.SetupDB(ctx, t, (*db.Cluster)(nil), (*db.NodePool)(nil), (*db.ControlPlaneConfiguration)(nil))
+	dbImpl := db.NewDB(bunDB)
+
+	imported := newValidCluster(withName("imported-site"))
+	_, err := bunDB.NewInsert().Model(&imported).Exec(ctx)
+	require.NoError(t, err)
+	importedPool := importedControlPlanePool(imported.ID, 1)
+	_, err = bunDB.NewInsert().Model(&importedPool).Exec(ctx)
+	require.NoError(t, err)
+
+	alreadySynced := newValidCluster(withName("already-synced"))
+	_, err = bunDB.NewInsert().Model(&alreadySynced).Exec(ctx)
+	require.NoError(t, err)
+	existingSnapshot, err := dbImpl.CreateControlPlaneConfiguration(ctx, &db.ControlPlaneConfiguration{
+		ClusterID: alreadySynced.ID,
+		Config: db.ControlPlaneConfigSpec{
+			Nico: &db.NicoControlPlaneProvider{Release: "existing-os"},
+		},
+		ChangeReason: "already present",
+	})
+	require.NoError(t, err)
+	_, err = bunDB.NewUpdate().
+		Model(&db.Cluster{
+			ID: alreadySynced.ID,
+			ControlPlaneConfig: db.ControlPlaneConfig{
+				ConfigurationID: existingSnapshot.ID,
+				DesiredCount:    3,
+			},
+		}).
+		Column("configuration_id", "cp_desired_count").
+		WherePK().
+		Exec(ctx)
+	require.NoError(t, err)
+	syncedPool := importedControlPlanePool(alreadySynced.ID, 3)
+	_, err = bunDB.NewInsert().Model(&syncedPool).Exec(ctx)
+	require.NoError(t, err)
+
+	deleting := newValidCluster(withName("deleting-site"))
+	deleting.Conditions.Deleting = db.Condition{Status: db.ConditionStatusTrue}
+	_, err = bunDB.NewInsert().Model(&deleting).Exec(ctx)
+	require.NoError(t, err)
+	deletingPool := importedControlPlanePool(deleting.ID, 1)
+	_, err = bunDB.NewInsert().Model(&deletingPool).Exec(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, db.SyncMissingControlPlaneConfigsFromCPNodePools(ctx, bunDB))
+
+	healed, err := dbImpl.GetCluster(ctx, imported.ID)
+	require.NoError(t, err)
+	assert.NotEqual(t, uuid.Nil, healed.ControlPlaneConfig.ConfigurationID)
+	assert.Equal(t, 1, healed.ControlPlaneConfig.DesiredCount)
+	require.NotNil(t, healed.ControlPlaneConfig.Nico)
+	assert.Equal(t, "nvke-sc-os", healed.ControlPlaneConfig.Nico.Release)
+	assert.Equal(t, "nvke-sc-cp", healed.ControlPlaneConfig.Nico.ConfigProfile)
+
+	unchanged, err := dbImpl.GetCluster(ctx, alreadySynced.ID)
+	require.NoError(t, err)
+	assert.Equal(t, existingSnapshot.ID, unchanged.ControlPlaneConfig.ConfigurationID)
+	assert.Equal(t, 3, unchanged.ControlPlaneConfig.DesiredCount)
+
+	stillMissing, err := dbImpl.GetCluster(ctx, deleting.ID)
+	require.NoError(t, err)
+	assert.Equal(t, uuid.Nil, stillMissing.ControlPlaneConfig.ConfigurationID)
+}
+
+func importedControlPlanePool(clusterID uuid.UUID, desired int) db.NodePool {
+	pool := db.NodePool{
+		ID:                   uuid.New(),
+		ClusterID:            clusterID,
+		Name:                 "nvke-tier-0-controlplane",
+		NodeNamePrefix:       "cp",
+		SystemReservedMemory: "16Gi",
+		ControlPlane:         true,
+		NodeLabels:           map[string]string{},
+		KubernetesVersion:    "1.34.2",
+		DesiredCount:         desired,
+		Conditions: db.NodePoolConditions{
+			Deleting: db.Condition{Status: db.ConditionStatusFalse},
+		},
+	}
+	pool.SetNico(db.NicoNodePoolProvider{
+		Release:               "nvke-sc-os",
+		ConfigProfile:         "nvke-sc-cp",
+		InstanceTypeID:        uuid.MustParse("00000000-0000-4000-8000-000000000008"),
+		SubnetIDs:             []uuid.UUID{uuid.MustParse("00000000-0000-4000-8000-000000000003")},
+		DiskSelectionStrategy: db.DiskSelectionStrategySmallest,
+	})
+	return pool
+}

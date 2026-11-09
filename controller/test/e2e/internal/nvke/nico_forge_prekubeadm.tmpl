@@ -1,0 +1,90 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+The commands that turn a booted machine into an NVKE node, run before kubeadm.
+Rendered by BuildForgeNodePayloads, one command per non-blank line, and sent as
+NodePoolCreateConfig.infra.preKubeadmCommands.
+
+The package versions are inputs for the same reason the OS image is: a
+qualification run exists to pin them.
+
+Every NVKE package installed here comes from the image's own apt repository,
+the flat file: repo that os-image/packer/scripts/provision.sh stages under
+/usr/lib/nvke/debs and indexes at bake time. No NVKE apt source is configured
+on the node, so what it installs is what the image carries, and the versions
+below have to be ones that image locks. A version it does not carry resolves to
+no candidate and fails here. That is the intended answer: a node reaching a
+repository for these would install whichever build the suite currently holds,
+which is a different build than the one under qualification, and nothing in the
+run would say so.
+
+Both OVN packages, not just -images. The agent resolves the charts package
+name and requires it to already be installed: chartsDebPresenceCheck returns
+errCNIChartsDebNotInstalled and the agent never installs it itself. That
+failure terminates the provisioning workflow rather than retrying, so putting
+the package on afterwards does not recover the run. openvswitch-switch is here
+for the same reason — OVN runs Open vSwitch on the host, and the agent checks
+for ovs-vsctl before helm. Both were observed on real Forge hardware before
+they were read out of the agent source.
+
+The image installs Open vSwitch at bake time, so this install is a no-op that
+asserts it is there. Older images carry Ubuntu's openvswitch-switch; current
+ones carry DOCA's doca-openvswitch-switch, which Provides it, and apt
+selects that as the only provider. --no-upgrade keeps it a no-op: without it an
+install can pull a newer Open vSwitch than the one the image was baked and
+smoke-tested with, which is the same defect this file fixes for the NVKE
+packages.
+
+nke-agent and spire-agent are deliberately absent. The image builds both as
+.debs from this checkout's source at bake time and installs them with dpkg, so
+their versions are the checkout's `git describe` and they are the builds under
+qualification (os-image/AGENTS.md, os-image/SPEC.md). spire-agent also owns the
+systemd units, the first-boot renderer and the TPM plugin checksum that
+agent.conf resolves against. A node without a baked agent is the
+bring-your-own-Ubuntu path, which bootstraps with --disable-mtls and is out of
+scope here.
+
+The unit and its environment file stay nke-, permanently. nvke-agent.service
+declares Alias=nke-agent.service and reads both environment files, so the old
+spelling works on images built before and after #1565 and the new one only
+after. Do not "finish" this rename.
+
+set -eu is the first command for the reason the site node has it
+(internal/infra/provision/userdata.go): cloud-init runs these as one /bin/sh
+script and reports the exit status of the last one, which is the
+touch at the end. Without the guard a failed apt step still writes the
+success sentinel, so the node reports a clean cloud-init while missing the
+packages it needs to join, never phones home, and the run spends its whole
+budget on KubernetesReady=Unknown ("Node data not available") with nothing
+saying why. set -u is safe because every command below is fully rendered
+before it is sent: none of them reads a shell variable.
+
+There is no apt-get update. os-image/packer/scripts/provision.sh indexes the
+local repo at bake time and clears the Ubuntu archive lists, precisely so
+"cluster create needs no apt-get update of its own". Running one here would
+refresh the archive again and let the Open vSwitch install upgrade past
+the baked build, which is the defect this file fixes for the NVKE packages.
+
+The route wait stays, because nke-agent.service is restarted at the end of
+this script and has to reach the controller. Forge hosts race cloud-init for
+the network, so on a node whose default route is not up yet that restart comes
+before the node can phone home. The amd64 kernel line in nico_forge_ipxe.tmpl
+does not carry ip=dhcp the way the arm64 one does, so amd64 nodes reach this
+point earlier relative to their network. Observed as an amd64 control plane
+failing cloud-init while an arm64 worker running these same commands passed,
+and the amd64 site node beside them passed only because its own user data
+waits for a route first. Bounded, so a node that never gets a route fails here
+with a line saying so rather than hanging the boot.
+*/ -}}
+set -eu
+timeout 300s sh -c 'until ip -4 route list default | grep -q .; do echo "waiting for an IPv4 default route"; sleep 5; done'
+DEBIAN_FRONTEND=noninteractive apt-get install -y nvke-kubeadm-distro-{{ .KubernetesVersion }}
+DEBIAN_FRONTEND=noninteractive apt-get install -y nvke-cni-ovn-images-{{ .CNIVersion }} nvke-cni-ovn-charts-{{ .CNIVersion }}
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-upgrade openvswitch-switch
+printf 'AGENT_ARGS="{{ .AgentArgs }}"\n' > /etc/default/nke-agent
+sysctl --system
+systemctl daemon-reload
+systemctl restart nke-agent.service
+systemctl restart procps
+touch /run/cloud-init.done

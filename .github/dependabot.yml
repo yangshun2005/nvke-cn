@@ -1,0 +1,153 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+version: 2
+updates:
+  # Go modules anywhere in the tree. This is a nested multi-module monorepo
+  # (agent, controller, controller/api, controller/nico-sim,
+  # controller/test/e2e, controller/hack/*, ...), so the recursive "/**/*" glob
+  # is required — "/*" only matches depth-1 dirs and would miss the nested modules.
+  # New components with their own go.mod are picked up automatically.
+  - package-ecosystem: gomod
+    directories:
+      - "/**/*"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "build"
+      prefix-development: "build"
+    groups:
+      # The Kubernetes staging modules — k8s.io/api, k8s.io/apimachinery,
+      # k8s.io/client-go, k8s.io/apiextensions-apiserver — are released in
+      # lockstep and only work as a matched set. k8s.io/api v0.36 removed
+      # autoscaling/v2beta1, autoscaling/v2beta2, networking/v1alpha1 and
+      # scheduling/v1alpha1; k8s.io/client-go one minor behind still imports
+      # those from its kubernetes/scheme package, so a mixed set does not
+      # resolve at all. Cluster API and controller-runtime are pinned to a
+      # Kubernetes minor in the same way.
+      #
+      # They get a group of their own so that failing to find a consistent set
+      # fails on its own, rather than taking every other dependency in the tree
+      # with it. Under a single "*" group, one unresolvable k8s bump aborted a
+      # grouped update covering 25 dependencies across four modules and left
+      # Dependabot Updates red on main:
+      #
+      #   k8s.io/api | dependency_file_not_resolvable
+      #     go: finding module for package k8s.io/api/autoscaling/v2beta1
+      #     github.com/dsx-ai-factory/nvke/controller/test/e2e/internal/kube imports
+      #       k8s.io/client-go/kubernetes/scheme imports
+      #       k8s.io/api/autoscaling/v2beta1
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+      go-dependencies:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+    ignore:
+      # sigs.k8s.io/cluster-api and sigs.k8s.io/cluster-api/test both go
+      # unresolvable at v1.14.0 and later: from that version on, each one's
+      # go.mod carries local replaces:
+      #
+      #   replace (
+      #     sigs.k8s.io/cluster-api     => ../
+      #     sigs.k8s.io/cluster-api/api => ../api
+      #   )
+      #
+      # A consumer ignores a dependency's replaces, so we resolve
+      # sigs.k8s.io/cluster-api/api at the placeholder version those leave
+      # behind, which does not exist. Requiring the real api module instead
+      # gives an ambiguous import, because api/ was split out of
+      # sigs.k8s.io/cluster-api between v1.12 and v1.14 and both still provide
+      # the same packages while the parent stays at v1.13. Dependabot hit this
+      # on the bare module too, grouped in with a controller-runtime bump --
+      # #901.
+      #
+      # Taking it needs a deliberate cluster-api 1.13 -> 1.14 migration of
+      # controller, cluster-api-provider-provisioned and
+      # controller/hack/capd-reboot-controller, moving the parent and the new
+      # api module together. Drop these two entries when that happens. See #88.
+      - dependency-name: "sigs.k8s.io/cluster-api"
+        versions: [">=1.14.0"]
+      - dependency-name: "sigs.k8s.io/cluster-api/test"
+        versions: [">=1.14.0"]
+
+      # A submodule of a repository whose root module is +incompatible:
+      # resolution walks up to the root, lands on v4.3.10, and finds no api/
+      # there. Nothing here requires the root module. Bump it by hand.
+      - dependency-name: "github.com/gravitational/teleport/api"
+
+      # Nothing above the pinned v1.3.0 resolves. v1.4.x requires its own
+      # sdk/standard submodule at v0.0.0-00010101000000-000000000000, the
+      # placeholder a local replace leaves behind; v1.5.0 renamed the module
+      # path to github.com/NVIDIA/infra-controller-rest, which then needs the
+      # import in nico-sim rewritten rather than go.mod edited.
+      - dependency-name: "github.com/NVIDIA/ncx-infra-controller-rest"
+
+      # Since the go 1.27.1 toolchain the updater reads the module path of
+      # github.com/google/cel-go as "downloading" (go_module_path_mismatch; the
+      # real path is cel.dev/cel-go) and marks every gomod run red, although it
+      # still updates the group PR. Nothing here requires cel-go directly.
+      - dependency-name: "github.com/google/cel-go"
+
+  # Dockerfiles anywhere in the tree (controller/, controller/hack/*, agent/, ...).
+  #
+  # This only reaches an image named on a FROM. Two forms in this tree are
+  # invisible to it: a variable registry (FROM ${BASE_REGISTRY}/alpine:3.24.1)
+  # and an image named through an ARG (ARG ALPINE_IMAGE=docker.io/alpine:...).
+  # The second one matters -- it is how the two published images name their
+  # golang and alpine bases. Those digests are followed by
+  # .github/workflows/base-image-digests.yml instead, which re-resolves the tag
+  # weekly and opens a pull request when it has been republished. Tag bumps
+  # there are still manual. Recorded with the evidence in the header of
+  # hack/base-image-check.sh.
+  - package-ecosystem: docker
+    directories:
+      - "/**/*"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "build"
+    groups:
+      docker-images:
+        patterns:
+          - "*"
+    ignore:
+      # registry.k8s.io images: Dependabot cannot query that registry anonymously.
+      - dependency-name: "dns/k8s-dns-node-cache"
+      - dependency-name: "kube-state-metrics/kube-state-metrics"
+      # Keep the Go minor version fixed. Patch bumps such as 1.26.6 to 1.26.7
+      # still come through, and land red: go.work owns the version, so a bump
+      # here fails `make go-version-check` until go.work moves with it. Run
+      # `make go-version-sync` to carry it into every go.mod. A minor bump such
+      # as 1.26 to 1.27 is the same mechanics plus a decision, so we do that by
+      # hand. See docs/go-workspace.md, "The Go version".
+      - dependency-name: "golang"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+    # Note: golang RC tags (e.g. golang:1.27rc1) do not follow semver, so
+    # Dependabot's `versions` filter cannot match them with a range expression.
+    # Close any RC-bump PRs manually; they resolve on their own once the stable
+    # release is available and Dependabot replaces them.
+
+  # Workflows and the composite actions they call. "/" covers
+  # .github/workflows/ only; it does not recurse into .github/actions/. That
+  # gap already drifted: malware-scan/action.yml sat on upload-sarif v4.37.8
+  # while all four workflow references were on v4.38.0.
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

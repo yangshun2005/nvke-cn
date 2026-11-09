@@ -1,0 +1,1484 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package proto;
+
+option go_package = "github.com/dsx-ai-factory/nvke/agent/pkg/agent/proto";
+
+service NodeAgent {
+  rpc GetKubeadmStatus(KubeadmStatusRequest) returns (KubeadmStatusResponse) {}
+
+  // InspectKubernetesCertificates reads the fixed kubeadm credential inventory.
+  // It never mutates files or returns certificate/key contents or identities.
+  rpc InspectKubernetesCertificates(InspectKubernetesCertificatesRequest) returns (InspectKubernetesCertificatesResponse) {}
+
+  // ScheduleNodeReboot waits up to five minutes for apt/dpkg locks to clear,
+  // then starts a detached reboot so the RPC can return before the node exits.
+  rpc ScheduleNodeReboot(ScheduleNodeRebootRequest) returns (ScheduleNodeRebootResponse) {}
+
+  // GetNodeBootInfo returns typed boot identity and timing information used by
+  // callers to confirm that a requested reboot completed.
+  rpc GetNodeBootInfo(GetNodeBootInfoRequest) returns (GetNodeBootInfoResponse) {}
+
+  rpc ExecuteKubeadmInit(KubeadmInitRequest) returns (KubeadmInitStatusResponse) {}
+
+  rpc ExecuteKubeadmJoin(KubeadmJoinRequest) returns (KubeadmJoinStatusResponse) {}
+
+  rpc ExecuteKubeadmReset(KubeadmResetRequest) returns (KubeadmResetStatusResponse) {}
+
+  // ReconfigureKubeletAPIServer updates the server endpoint in the local
+  // kubelet.conf, restarts kubelet, and verifies the service is active. The
+  // config update is atomic and convergent. If kubelet cannot be restarted
+  // after a config change, the agent restores the original config and tries to
+  // restore the service before returning a structured failure outcome.
+  rpc ReconfigureKubeletAPIServer(ReconfigureKubeletAPIServerRequest) returns (ReconfigureKubeletAPIServerResponse) {}
+
+  // ReconfigureSpireAgent points the node's SPIRE agent at a new SPIRE server.
+  // It rewrites server_address and server_port in the agent config and in the
+  // boot-time SPIRE environment file, restarts spire-agent, and waits until the
+  // agent serves an X.509 SVID issued after the restart. The agent may exit
+  // once while it re-attests to the new server; systemd restarts it. Repeating
+  // the call with the same server is safe.
+  rpc ReconfigureSpireAgent(ReconfigureSpireAgentRequest) returns (ReconfigureSpireAgentResponse) {}
+
+  // GetSpireAgentStatus reports the SPIRE server the node's agent config points
+  // at and whether the agent holds a valid X.509 SVID from that server.
+  rpc GetSpireAgentStatus(GetSpireAgentStatusRequest) returns (GetSpireAgentStatusResponse) {}
+
+  // StartOpenVSwitchReconciliation durably accepts an asynchronous host-network
+  // reconciliation that moves the default-route interface's existing network
+  // configuration onto an Open vSwitch bridge named br<interface>. The
+  // operation_id is an idempotency key, so losing this RPC response while the
+  // default route moves does not start duplicate work.
+  rpc StartOpenVSwitchReconciliation(StartOpenVSwitchReconciliationRequest) returns (StartOpenVSwitchReconciliationResponse) {}
+
+  // GetOpenVSwitchReconciliationStatus returns the persisted state of a
+  // previously accepted Open vSwitch reconciliation.
+  rpc GetOpenVSwitchReconciliationStatus(GetOpenVSwitchReconciliationStatusRequest) returns (GetOpenVSwitchReconciliationStatusResponse) {}
+
+  // KubeadmUpgradeApply upgrades the Kubernetes control plane and its add-ons
+  // to target_version. The request is accepted only on a control-plane node.
+  // Retrying the same target is safe because kubeadm upgrade apply is
+  // idempotent and is run again to finish any incomplete add-on convergence.
+  rpc KubeadmUpgradeApply(KubeadmUpgradeApplyRequest) returns (KubeadmUpgradeApplyResponse) {}
+
+  // ReconcileKubeVip atomically converges the kube-vip static-pod manifest for
+  // NVKE's active/active BGP control-plane mode. The fixed mode disables every
+  // Kubernetes API-backed kube-vip feature. For kube-vip v1.2.0 compatibility,
+  // the pod receives a kubeconfig with no client credential; this RPC never
+  // reads, creates, or mounts the host's admin.conf or super-admin.conf.
+  rpc ReconcileKubeVip(ReconcileKubeVipRequest) returns (ReconcileKubeVipResponse) {}
+
+  // StartKubernetesCertificateRenewal starts a V1 asynchronous control-plane
+  // certificate renewal operation. The operation_id is an idempotency key.
+  // Callers that require forced renewal or strict etcd membership validation
+  // must use StartKubernetesCertificateRenewalV2.
+  rpc StartKubernetesCertificateRenewal(StartKubernetesCertificateRenewalRequest) returns (StartKubernetesCertificateRenewalResponse) {}
+
+  // StartKubernetesCertificateRenewalV2 starts an asynchronous control-plane
+  // certificate renewal operation with forced-renewal and exact etcd-membership
+  // semantics. Its distinct method name lets callers detect V1-only agents
+  // before any renewal operation is accepted.
+  rpc StartKubernetesCertificateRenewalV2(StartKubernetesCertificateRenewalV2Request) returns (StartKubernetesCertificateRenewalV2Response) {}
+
+  // GetKubernetesCertificateRenewalStatus returns the current status for a
+  // previously started certificate renewal operation.
+  rpc GetKubernetesCertificateRenewalStatus(GetKubernetesCertificateRenewalStatusRequest) returns (GetKubernetesCertificateRenewalStatusResponse) {}
+
+  // RemoveEtcdMember removes a remote member through the local kubeadm etcd
+  // endpoint. It rejects removal of the local member, attempts to transfer
+  // leadership to the local member before removing a leader, and treats an
+  // absent target as success.
+  rpc RemoveEtcdMember(RemoveEtcdMemberRequest) returns (RemoveEtcdMemberResponse) {}
+
+  // GetEtcdStatus reports the local etcd member's backend sizing and role.
+  // Read-only and side-effect free: it uses etcd's Status and MemberList
+  // maintenance APIs and reads the static-pod manifest, never the key/value
+  // API, so it is safe to poll.
+  //
+  // The caller decides whether defragmentation is warranted; this RPC only
+  // reports. reclaimable_bytes (db_total_size - db_total_size_in_use) is the
+  // figure to gate on, not db_total_size: a large file backed by live data is
+  // not reclaimable and defragmentation would not shrink it.
+  rpc GetEtcdStatus(GetEtcdStatusRequest) returns (GetEtcdStatusResponse) {}
+
+  // StartEtcdDefrag starts an asynchronous offline defragmentation of the local
+  // etcd member by restarting it so etcd defragments during bootstrap. It never
+  // calls `etcdctl defrag`, which blocks the member while it runs.
+  //
+  // The etcd manifest is never moved or modified. The restart is `crictl stop`
+  // on the etcd container, and kubelet starts a replacement from the manifest
+  // that stayed in place. etcd then defragments during bootstrap if its
+  // configured threshold is met.
+  //
+  // Because the threshold is what decides whether the restart accomplishes
+  // anything, the agent reads it from the manifest and refuses up front when
+  // reclaimable_bytes is below it, reporting OUTCOME_REFUSED without touching
+  // etcd. A restart that cannot defragment is pure downtime, so it is not
+  // attempted. The agent never edits the threshold - it is set by kubeadm when
+  // the node is provisioned - so the configured value is always honored.
+  //
+  // THE CALLER MUST NOT TAKE THIS NODE OUT OF SERVICE FIRST. The agent performs
+  // the whole per-node sequence, including the withdrawal and the return:
+  // health preflight, voting member check, leadership transfer away from the
+  // local member if it is leader, withdrawal from the control-plane VIP,
+  // stopping kube-apiserver, the etcd restart, the wait for etcd to return
+  // healthy, then kube-apiserver and kube-vip back in that order. The caller
+  // sequences members; it does not orchestrate within one. Bracketing this RPC
+  // with a withdrawal of its own would take out a node that is about to do it
+  // anyway and restore one that has already come back - in the rollout
+  // framework that means no kube-vip NodeGuard around this call.
+  //
+  // kube-apiserver is stopped as well as the VIP withdrawn because two separate
+  // paths reach this node's apiserver, and the VIP is only one of them. The
+  // kubernetes.default Service resolves to control-plane node IPs rather than
+  // to the VIP, so withdrawing the VIP alone leaves kube-proxy load balancing
+  // in-cluster clients onto an apiserver whose only etcd backend is down.
+  // Stopping the apiserver closes that path too, and the endpoint reconciler
+  // prunes and republishes this node's IP on its own as the apiserver stops and
+  // resumes renewing its masterlease - neither direction needs a caller.
+  //
+  // "Withdrawal" is not a drain in the kubectl sense. No workload is evicted
+  // and the node is not cordoned. What stops is this node's participation in
+  // serving the Kubernetes API.
+  //
+  // A member that fails to return healthy after the restart is left withdrawn
+  // on purpose, with kube-apiserver and kube-vip still parked, and reports
+  // OUTCOME_FAILED_NOT_RESTORED. Returning either one would route traffic to an
+  // apiserver with no etcd behind it rather than leaving the remaining members
+  // to carry the cluster. That case needs an operator: no agent-side action
+  // recovers an etcd that will not start from its own unmodified manifest.
+  //
+  // An agent that dies mid-sequence restores what it parked on next startup,
+  // before it serves any RPC, so an interrupted defragmentation does not leave
+  // a node permanently out of the control plane.
+  //
+  // Success means the local apiserver answered GET /readyz with 200 and the VIP
+  // is back on loopback. It does not mean this node is carrying VIP traffic
+  // again. kube-vip speaks BGP in-process and announces the route on its own
+  // first successful /readyz probe, so nothing on the node can observe whether
+  // the upstream peer has installed it - the metrics kube-vip exports cover the
+  // peer session state, not which prefixes are advertised. Returning to service
+  // is therefore reported as "every local precondition for announcement now
+  // holds", and a caller that needs proof the node is in the ECMP set has to
+  // check the VIP from off the node.
+  //
+  // Readiness is waited for before kube-vip is restored rather than after,
+  // because that first probe is the one that decides when the route goes out.
+  //
+  // The operation_id is an idempotency key; retrying with the same operation_id
+  // returns the existing operation instead of restarting etcd a second time.
+  rpc StartEtcdDefrag(StartEtcdDefragRequest) returns (StartEtcdDefragResponse) {}
+
+  // GetEtcdDefragStatus returns the current status for a previously started
+  // asynchronous etcd defragmentation, including how many bytes were reclaimed.
+  rpc GetEtcdDefragStatus(GetEtcdDefragStatusRequest) returns (GetEtcdDefragStatusResponse) {}
+
+  // StartK8sControlPlaneNodeGracefulShutdown starts an asynchronous
+  // control-plane node graceful shutdown operation. The operation_id is an
+  // idempotency key; retrying with the same operation_id returns the existing
+  // operation instead of starting duplicate work.
+  rpc StartK8sControlPlaneNodeGracefulShutdown(StartK8sControlPlaneNodeGracefulShutdownRequest) returns (StartK8sControlPlaneNodeGracefulShutdownResponse) {}
+
+  // GetK8sControlPlaneNodeGracefulShutdownStatus returns the current status for
+  // a previously started asynchronous control-plane node graceful shutdown.
+  rpc GetK8sControlPlaneNodeGracefulShutdownStatus(GetK8sControlPlaneNodeGracefulShutdownStatusRequest) returns (GetK8sControlPlaneNodeGracefulShutdownStatusResponse) {}
+
+  // StartKubeVipRestore starts an asynchronous restore for kube-vip on a node
+  // previously prepared by StartK8sControlPlaneNodeGracefulShutdown. It waits
+  // for the local apiserver to answer GET /readyz with 200, restores the
+  // kube-vip static pod manifest, and waits for the VIP to appear on loopback
+  // again. The operation_id is an idempotency key; retrying with the same
+  // operation_id returns the existing operation instead of starting duplicate
+  // work.
+  //
+  // Nothing in the agent restores kube-apiserver, so the caller owns bringing it
+  // back before calling this. The readiness wait verifies that rather than
+  // assuming it: an apiserver that never becomes ready fails the operation, but
+  // the kube-vip manifest is restored anyway, because kube-vip announces no
+  // route until its own /readyz probe passes and a manifest left parked would
+  // need another call to undo.
+  //
+  // As with StartEtcdDefrag, success does not prove the upstream peer has
+  // installed the route; that is only observable from off the node.
+  rpc StartKubeVipRestore(StartKubeVipRestoreRequest) returns (StartKubeVipRestoreResponse) {}
+
+  // InstallCNI deploys packaged CNI charts or manifests into the cluster (helm install /
+  // kubectl apply). It assumes the charts/manifest Debian package is already installed
+  // on this node — use InstallPackages (or apt) for nvke-cni-ovn-charts-<stream>,
+  // nvke-cni-calico-manifests-<stream>, and optional image packages (when not pulling
+  // exclusively from a tenant registry).
+  //
+  // OVN resolves the chart tree from /etc/dgx/ovn-kubernetes when present else from the
+  // installed charts package. Calico follows the Helm or static manifest layout under
+  // the manifests package install path.
+  //
+  // cni_variant UNSPECIFIED is treated as OVN. version selects the Debian stream suffix
+  // used to derive the charts package logical name only (defaults match cni-packages).
+  rpc InstallCNI(InstallCNIRequest) returns (InstallCNIResponse) {}
+
+  rpc UpdateAndFetchKubeAdmJoinStrings(KubeadmJoinStringRequest) returns (KubeadmJoinStringResponse) {}
+
+  rpc GetKubeconfig(KubeconfigRequest) returns (KubeconfigResponse) {}
+
+  rpc ExecuteScript(ExecuteScriptRequest) returns (ExecuteScriptResponse) {}
+
+  rpc GetKubeadmJoinString(KubeadmJoinStringRequest) returns (KubeadmJoinStringResponse) {}
+
+  rpc InitializeKubernetesAPIEncryption(InitializeKubernetesAPIEncryptionRequest) returns (InitializeKubernetesAPIEncryptionResponse) {}
+
+  // PromoteKubernetesAPIEncryptionProviders reorders encryption providers from
+  // identity-then-secretbox (existing-cluster bootstrap) to secretbox-then-identity
+  // on this node, then waits for the local apiserver to reload the config.
+  // Run on every control-plane node after phase-1 InitializeKubernetesAPIEncryption;
+  // then call StartEtcdEncryptionAtRestObjectsRewrite once and poll
+  // GetEtcdEncryptionAtRestObjectsRewriteStatus until the operation succeeds.
+  rpc PromoteKubernetesAPIEncryptionProviders(PromoteKubernetesAPIEncryptionProvidersRequest) returns (PromoteKubernetesAPIEncryptionProvidersResponse) {}
+
+  // UpdateEncryptionConfig applies a single key-rotation mutation to the local
+  // EncryptionConfiguration file, then blocks until the local apiserver
+  // confirms a successful reload of the new config. The call returns only
+  // after the new config is active in the apiserver's memory.
+  //
+  // The call is idempotent and safe to retry on DeadlineExceeded: a WAL-style
+  // state file is written before the config is touched, so a crash or a
+  // timed-out call can be resumed without re-applying the mutation.
+  //
+  // Once the WAL entry is written it is removed only when the reload is
+  // confirmed. Every later failure retains it (and possibly the written
+  // config), and other mutations fail until the same operation is retried.
+  //
+  // Error codes:
+  //   FailedPrecondition — encryption-config.yaml is missing (run
+  //                        InitializeKubernetesAPIEncryption first); a WAL entry
+  //                        from a different operation exists (retry that
+  //                        operation first); the apiserver has not yet loaded the
+  //                        current config; or the config or WAL ownership
+  //                        changed, or the config became unreadable, before or
+  //                        during confirmation.
+  //   DeadlineExceeded,
+  //   Canceled         — reload was not confirmed before the deadline or
+  //                      cancellation; the call is safe to retry.
+  //   Unavailable      — apiserver metrics stayed unavailable, so the reload
+  //                      cannot be confirmed; retry after they recover.
+  //   other codes      — invalid request, non-control-plane node, invalid
+  //                      config or mutation, or a local I/O failure.
+  rpc UpdateEncryptionConfig(UpdateEncryptionConfigRequest) returns (UpdateEncryptionConfigResponse) {}
+
+  // Looks up a storage key name in the local configuration without returning key material.
+  rpc GetEtcdEncryptionKeyIdentity(GetEtcdEncryptionKeyIdentityRequest) returns (GetEtcdEncryptionKeyIdentityResponse) {}
+
+  // StartEtcdEncryptionAtRestObjectsRewrite starts an asynchronous rewrite of
+  // Kubernetes API objects so they are persisted with the current etcd
+  // encryption-at-rest configuration. The operation_id is an idempotency key;
+  // retrying with the same operation_id returns the existing operation instead
+  // of starting duplicate work. An agent only runs one rewrite operation at
+  // a time.
+  rpc StartEtcdEncryptionAtRestObjectsRewrite(StartEtcdEncryptionAtRestObjectsRewriteRequest) returns (StartEtcdEncryptionAtRestObjectsRewriteResponse) {}
+
+  // GetEtcdEncryptionAtRestObjectsRewriteStatus returns the current status for
+  // a previously started asynchronous rewrite operation.
+  rpc GetEtcdEncryptionAtRestObjectsRewriteStatus(GetEtcdEncryptionAtRestObjectsRewriteStatusRequest) returns (GetEtcdEncryptionAtRestObjectsRewriteStatusResponse) {}
+
+  rpc RemovePlainTextSecondaryEncryptionEntry(RemovePlainTextSecondaryEncryptionEntryRequest) returns (RemovePlainTextSecondaryEncryptionEntryResponse) {}
+
+  rpc UploadFileBundle(stream FileChunk) returns (UploadStatus) {}
+
+  // WriteNodeAgentConfig replaces /etc/agent/config.yaml with the given YAML
+  // (NodeSpec) using an atomic write and serializes concurrent callers on this agent.
+  rpc WriteNodeAgentConfig(WriteNodeAgentConfigRequest) returns (WriteNodeAgentConfigResponse) {}
+
+  rpc StreamExecuteScript(ExecuteScriptRequest) returns (stream ScriptOutputChunk) {}
+
+  rpc InstallBundle(InstallBundleRequest) returns (InstallBundleResponse) {}
+
+  rpc GetBundleStatus(GetBundleStatusRequest) returns (GetBundleStatusResponse) {}
+
+  rpc InstallCollection(InstallCollectionRequest) returns (InstallCollectionResponse) {}
+
+  // Debian package management
+
+  // StartNodeAgentUpgrade persists an idempotent node-agent replacement
+  // request and starts the independent nvke-agent-updater systemd service. The
+  // caller must poll GetNodeAgentUpgradeStatus because a successful package
+  // replacement restarts this gRPC server.
+  rpc StartNodeAgentUpgrade(StartNodeAgentUpgradeRequest) returns (StartNodeAgentUpgradeResponse) {}
+
+  // GetNodeAgentUpgradeStatus returns durable updater state that survives an
+  // nvke-agent restart.
+  rpc GetNodeAgentUpgradeStatus(GetNodeAgentUpgradeStatusRequest) returns (GetNodeAgentUpgradeStatusResponse) {}
+
+  rpc InstallPackages(InstallPackagesRequest) returns (InstallPackagesResponse) {}
+
+  rpc ListPackages(ListPackagesRequest) returns (ListPackagesResponse) {}
+
+  rpc RemovePackages(RemovePackagesRequest) returns (RemovePackagesResponse) {}
+
+  rpc GetSupportBundle(GetSupportBundleRequest) returns (GetSupportBundleResponse) {}
+
+  rpc ExecuteKubeadmPreflight(KubeadmPreflightRequest) returns (KubeadmPreflightResponse) {}
+
+  // ExecuteNodePreflight runs optional node readiness checks and optional kubeadm preflight.
+  // Set check_cloud_init_status to wait for cloud-init bootstrap to complete, or use checks
+  // for caller-defined file_exists assertions (e.g. legacy sentinel files).
+  // When kubeadm_preflight is set, the caller supplies rendered kubeadm config YAML and the agent
+  // runs kubeadm phase preflight on this node.
+  // Like ExecuteKubeadmPreflight, invalid requests and execution failures return gRPC OK with
+  // status = "error" and error_message rather than an RPC error status.
+  rpc ExecuteNodePreflight(ExecuteNodePreflightRequest) returns (ExecuteNodePreflightResponse) {}
+
+  // Installs the signing key, writes sources.list.d (deb_uri + suite + components), optional pin, apt-get update.
+  rpc ConfigureAptRepo(ConfigureAptRepoRequest) returns (ConfigureAptRepoResponse) {}
+
+  // Removes the keyring, NVKE apt preferences, and a matching sources.list.d entry so
+  // apt update succeeds afterward. By default removes <keyring_name>.list; override with
+  // sources_list_basename when the file name differs.
+  rpc RemoveAptRepo(RemoveAptRepoRequest) returns (RemoveAptRepoResponse) {}
+
+  // PatchAPIServerManifest applies an allowlisted, convergent change to the
+  // kube-apiserver static-pod manifest on a control-plane node and verifies the
+  // apiserver stays Ready, self-restoring on failure. strategic_merge_patches
+  // handle the keyed sections (volumes, volumeMounts); flag_ops handle the
+  // keyless command/args flag list. files are staged before the manifest edit;
+  // remove_files are unlinked after readiness is confirmed.
+  //
+  // Convergent and idempotent: the agent reads the live manifest, applies the
+  // patch and flag_ops in memory, and snapshots/writes only if the result
+  // differs. A re-run against an already-applied manifest returns OUTCOME_UNCHANGED.
+  //
+  // Two-lane contract: every state the agent can leave the node in — APPLIED,
+  // UNCHANGED, FAILED_RESTORED, FAILED_NOT_RESTORED — is reported in
+  // response.outcome with a NIL gRPC error, so whether the node was left in its
+  // pre-call state (FAILED_RESTORED) or in an unconfirmed state needing
+  // intervention (FAILED_NOT_RESTORED) survives the wire; the caller decides
+  // what to do with that. A gRPC error is returned only when the request could
+  // not be attempted and the node was not modified:
+  //   FailedPrecondition — not a control-plane node, or the apiserver static-pod
+  //                        manifest is missing or unparseable.
+  //   InvalidArgument    — the request failed validation (non-absolute or
+  //                        non-canonical file path, content over 1 MiB, or a
+  //                        malformed flag op).
+  rpc PatchAPIServerManifest(PatchAPIServerManifestRequest) returns (PatchAPIServerManifestResponse) {}
+}
+
+message GetSupportBundleRequest {
+  // Optional list of additional absolute file paths to include in the bundle (e.g. /var/log/myapp.log).
+  repeated string additional_files = 1;
+}
+
+message GetSupportBundleResponse {
+  bytes bundle_tgz = 1;
+  string error_message = 2;
+}
+
+message KubeadmStatusRequest {}
+
+message KubeadmStatusResponse {
+  string kubeadm_status = 1;
+  string kubeadm_phase = 2;
+  string cni_install_status = 3;
+  string kubeadm_current_message = 4;
+  repeated string kubeadm_completed_phases = 5;
+  string agent_version = 6;
+  reserved 7;
+}
+
+message File {
+  // Absolute filesystem path where the file should be written.
+  string path = 1;
+  // File contents. The agent limits each file to 1 MiB.
+  bytes content = 2;
+  // Unix permission bits. Values outside 0 through 0777 are rejected.
+  uint32 mode = 3;
+  // Owner in user:group format, for example root:root.
+  string owner = 4;
+}
+
+message PatchAPIServerManifestRequest {
+  // Strategic-merge patches applied in order to the kube-apiserver static-pod
+  // manifest (a core/v1 Pod). Used for keyed sections — volumes, volumeMounts,
+  // env — which strategic-merge reconciles idempotently by their merge key.
+  // Repeated so a change that is awkward or impossible to express as one patch
+  // can be split across several. Empty entries are ignored. Optional.
+  repeated bytes strategic_merge_patches = 1;
+
+  // Convergent operations on the apiserver flag list (container command/args),
+  // which strategic-merge cannot reconcile because it is a keyless string list.
+  // Applied after the strategic-merge patches. Optional.
+  repeated FlagOp flag_ops = 2;
+
+  // Files staged on disk before the manifest edit, so volume-mount targets exist
+  // when the apiserver restarts. Each path must be absolute and canonical (no
+  // root restriction, matching the init/join file-write RPCs); each file is
+  // limited to 1 MiB.
+  repeated File files = 3;
+
+  // Absolute, canonical paths unlinked after the manifest no longer references
+  // them and the apiserver is confirmed Ready. Absence is not an error.
+  repeated string remove_files = 4;
+}
+
+// FlagOp is a convergent mutation of a single kube-apiserver flag.
+message FlagOp {
+  oneof op {
+    SetFlag set = 1;
+    RemoveFlag remove = 2;
+  }
+}
+
+// SetFlag ensures --<name>=<value> is present exactly once with this value,
+// replacing an existing --<name> whose value differs. Idempotent.
+message SetFlag {
+  // Flag name without the leading dashes, e.g. "authentication-config".
+  string name = 1;
+  string value = 2;
+}
+
+// RemoveFlag strips every occurrence of --<name>[=...] from the command and args.
+message RemoveFlag {
+  // Flag name without the leading dashes.
+  string name = 1;
+}
+
+message PatchAPIServerManifestResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // The manifest and/or staged files changed and the apiserver verified Ready.
+    OUTCOME_APPLIED = 1;
+    // The node already matched the desired state; nothing was written or snapshotted.
+    OUTCOME_UNCHANGED = 2;
+    // The apply failed and the manifest was restored from the snapshot and
+    // re-verified Ready. The node is back in its pre-call state.
+    OUTCOME_FAILED_RESTORED = 3;
+    // The apply failed and the restore could not be confirmed. The node is in an
+    // unconfirmed state and needs manual intervention.
+    OUTCOME_FAILED_NOT_RESTORED = 4;
+  }
+  Outcome outcome = 1;
+  // Populated only on FAILED_* outcomes.
+  string error_message = 2;
+  // Path of the retained pre-mutation manifest snapshot, for forensics. Empty
+  // when no snapshot was taken (UNCHANGED, or a files-only change).
+  string backup_manifest_path = 3;
+}
+
+message KubeadmInitRequest {
+  string pod_network_cidr = 1;
+  string service_cidr = 2;
+  string control_plane_endpoint = 3;
+  string extraApiCertSans = 4;
+  repeated string extra_args = 5;
+  // When no_cni_install is false, used for the legacy in-init CNI install (InstallCNIPlugin path).
+  // Otherwise use InstallCNI (or InstallCNIPlugin) after init.
+  string tigera_operator_manifest = 6 [deprecated = true];
+  // When no_cni_install is false, used for the legacy in-init CNI install.
+  string tigera_custom_resource_manifest = 7 [deprecated = true];
+  // Deprecated: ignored; use InstallCNI after init.
+  bool use_cilium_cni = 8 [deprecated = true];
+  string init_config = 9;
+  bool api_encryption_enabled = 10;
+  string api_encryption_key = 11;
+  repeated string objects_to_encrypt = 12;
+  // Deprecated: ignored; use InstallCNI after init.
+  bool use_ovn_k8s_cni = 13 [deprecated = true];
+  // When no_cni_install is false, passed to the legacy in-init CNI install.
+  map<string, string> cni_config = 14 [deprecated = true];
+
+  // When no_cni_install is false, selects ovn / tigera / calico for the legacy in-init install.
+  string cni_plugin_name = 15 [deprecated = true];
+  // When no_cni_install is false, Tigera/Calico version for the legacy in-init install.
+  string tigera_version = 16 [deprecated = true];
+
+  // When no_cni_install is false, OVN plugin version for the legacy in-init install.
+  string ovn_version = 17 [deprecated = true];
+
+  // When no_cni_install is false, skip the legacy in-init CNI install (e.g. custom manifest only).
+  bool skip_cni_plugin_install = 18 [deprecated = true];
+
+  bool use_staging = 19;
+  repeated File files = 20;
+  // When false (default), after a successful init the agent may install CNI using the legacy
+  // InstallCNIPlugin path and the fields above (unless skip_cni_plugin_install is set).
+  // When true, CNI is not installed during init; use InstallCNI (recommended) or InstallCNIPlugin after init.
+  bool no_cni_install = 21;
+  // Kubernetes control-plane version for kubeadm static-pod images (e.g. v1.31.9).
+  // Used only when init_config is empty (CLI kubeadm init path): implies --kubernetes-version.
+  // Canonical form uses a leading v. When empty, the agent tries kubeadm version -o short from the binary on PATH.
+  // When init_config is non-empty, set kubernetesVersion inside ClusterConfiguration instead (NVKE controller kubeadm templates already do).
+  string kubernetes_version = 22;
+  // Empty preserves the legacy bootstrap name. Must match the existing storage identity on joins/replacements.
+  string api_encryption_key_name = 23;
+}
+
+message KubeadmInitStatusRequest {}
+
+message KubeadmInitStatusResponse {
+  string kubeadm_init_status = 1;
+  string controlplane_join_string = 2;
+  string worker_join_string = 3;
+  string status = 4;
+  string phase = 5;
+  string role = 6;
+  string error_message = 7;
+}
+
+message KubeadmJoinRequest {
+  string kubeadm_join_string = 1;
+  string join_config = 2;
+  string api_encryption_key = 3;
+  string certificate_key = 4;
+  repeated File files = 5;
+  string api_encryption_key_name = 6;
+}
+
+message KubeadmJoinStatusRequest {}
+
+message KubeadmJoinStatusResponse {
+  string kubeadm_join_status = 1;
+  string error_message = 2;
+  string status = 3;
+  string phase = 4;
+  string role = 5;
+}
+
+message KubeadmResetRequest {
+  string reset_config = 1;
+  // skip_phases is a list of kubeadm reset phase names to skip.
+  // Each entry is appended as `--skip-phases=<entry>` to the kubeadm reset
+  // command. Multiple entries result in multiple flags. Typical use:
+  //   skip_phases = ["remove-etcd-member"]
+  // for the CP teardown path where the cluster-side etcd member removal has
+  // already been performed by an executor node, so the local kubeadm reset
+  // should not try to remove the local etcd member again (that call hangs
+  // because the local etcd is no longer in the raft quorum).
+  repeated string skip_phases = 2;
+}
+
+message KubeadmResetStatusResponse {
+  string status = 1;
+  string phase = 2;
+  string role = 3;
+  string error_message = 4;
+}
+
+enum NodeAgentOperationPhase {
+  NODE_AGENT_OPERATION_PHASE_UNSPECIFIED = 0;
+  NODE_AGENT_OPERATION_PHASE_RUNNING = 1;
+  NODE_AGENT_OPERATION_PHASE_SUCCEEDED = 2;
+  NODE_AGENT_OPERATION_PHASE_FAILED = 3;
+}
+
+message NodeAgentOperationStatus {
+  string operation_id = 1;
+  NodeAgentOperationPhase phase = 2;
+  string step = 3;
+  string error_message = 4;
+}
+
+message StartK8sControlPlaneNodeGracefulShutdownRequest {
+  string operation_id = 1;
+  bool stop_kube_apiserver = 2;
+}
+
+message StartK8sControlPlaneNodeGracefulShutdownResponse {
+  NodeAgentOperationStatus operation = 1;
+}
+
+message GetK8sControlPlaneNodeGracefulShutdownStatusRequest {
+  string operation_id = 1;
+}
+
+message GetK8sControlPlaneNodeGracefulShutdownStatusResponse {
+  NodeAgentOperationStatus operation = 1;
+}
+
+enum InstallMethod {
+  Kubectl = 0;
+  Helm = 1;
+}
+
+enum CniVariant {
+  // Default for InstallCNI: treated as OVN when version is empty (default Debian stream suffix, e.g. 2.4.2).
+  CNI_VARIANT_UNSPECIFIED = 0;
+  CNI_VARIANT_OVN = 1;
+  CNI_VARIANT_CALICO = 2;
+}
+
+// Historical: InstallCNI used to distinguish image vs charts debs via cni_apt_role.
+enum CniAptRole {
+  CNI_APT_ROLE_UNSPECIFIED = 0;
+  CNI_APT_ROLE_IMAGES = 1;
+  CNI_APT_ROLE_CHARTS = 2;
+}
+
+// Legacy request shape used by the in-init CNI path during KubeadmInit when
+// no_cni_install is false. Stand-alone InstallCNIPlugin RPC was removed; use
+// InstallCNI for post-init installs.
+message InstallCNIPluginRequest {
+  string plugin_name = 1;
+  string plugin_url = 2;
+  string tigera_operator_manifest = 3;
+  string tigera_custom_resource_manifest = 4;
+  string pod_network_cidr = 5;
+  string service_cidr = 6;
+  map<string, string> cni_config = 7;
+  string plugin_version = 8;
+  string bundle_url = 9;
+}
+
+message InstallCNIRequest {
+  // OVN or CALICO; when UNSPECIFIED the agent uses OVN (stream selects nvke-cni-ovn-charts-<stream>, etc.).
+  CniVariant cni_variant = 1;
+  // Selects Debian stream suffix in the charts/manifest package name used to locate bundled
+  // charts on disk (leading "v" stripped). Empty uses defaults matching cni-packages (OVN 2.4.2,
+  // Calico 3.30.1). Non-empty duplicates the suffix for an optional apt pin suffix (foobar=VERSION)
+  // in the logical package spec string for logging/compatibility — install the pinned deb separately.
+  string version = 2;
+  // Deprecated — ignored except cni_apt_role IMAGES, which returns invalid argument from InstallCNI.
+  CniAptRole cni_apt_role = 3 [deprecated = true];
+  // Deprecated — ignored (InstallCNI always applies to the cluster from a control-plane node).
+  bool apply_to_cluster = 4 [deprecated = true];
+  // Optional; used as helm --set for OVN (and optional Calico chart) when deploying charts.
+  string pod_network_cidr = 5;
+  string service_cidr = 6;
+  // Optional; extra helm --set key/values (OVN and Calico chart deploy paths).
+  map<string, string> cni_config = 7;
+  // Calico charts only: optional Tigera operator / custom-resources YAML overrides under manifests/.
+  string tigera_operator_manifest = 8;
+  string tigera_custom_resource_manifest = 9;
+  // Deprecated — ignored. InstallCNI never runs apt; install debs via InstallPackages first.
+  bool skip_apt = 10 [deprecated = true];
+}
+
+message InstallCNIResponse {
+  string status = 1;
+  string error_message = 2;
+  // Charts/manifest Debian package logical name resolved from variant and version (informational —
+  // the orchestrator installs this via InstallPackages or apt before calling InstallCNI).
+  string resolved_apt_package = 3;
+}
+
+message KubeadmJoinStringRequest {}
+
+message KubeadmJoinStringResponse {
+  string controlplane_join_string = 1;
+  string worker_join_string = 2;
+}
+
+message KubernetesClusterStatusRequest {}
+
+message KubernetesClusterStatusResponse {
+  string kubernetes_cluster_status = 1;
+  string error_message = 2;
+}
+
+message KubeconfigRequest {}
+
+message KubeconfigResponse {
+  string kubeconfig = 1;
+  string error_message = 2;
+}
+
+message ExecuteScriptRequest {
+  string script_name = 1;
+  string script_contents = 2;
+  // path to script, default is /usr/local/nvke/user-scripts
+  string script_path = 3;
+  repeated string args = 4;
+  bool async = 5;
+}
+
+message ExecuteScriptResponse {
+  string output = 1;
+  string status = 2;
+  int32 exit_code = 3;
+  string error_message = 4;
+  string request_id = 5;
+}
+
+message InitializeKubernetesAPIEncryptionRequest {
+  string encryption_key = 1;
+  // When empty, a built-in default list is used. Identity is always the first
+  // provider (then secretbox); new clusters use kubeadm init encryption instead.
+  repeated string objects_to_encrypt = 2;
+  string encryption_key_name = 3;
+}
+
+message InitializeKubernetesAPIEncryptionResponse {
+  string status = 1;
+  string error_message = 2;
+}
+
+message PromoteKubernetesAPIEncryptionProvidersRequest {}
+
+// PromoteKubernetesAPIEncryptionProvidersResponse is empty on success.
+// On failure the gRPC status code and message carry the error (same pattern as
+// UpdateEncryptionConfig): for example DeadlineExceeded when the apiserver did
+// not confirm a config reload within the deadline (safe to retry).
+message PromoteKubernetesAPIEncryptionProvidersResponse {}
+
+// UpdateEncryptionConfig messages
+
+message AddSecondaryKeyOperation {
+  string new_key = 1; // base64-encoded 32-byte secretbox key
+  string key_name = 2; // empty retains legacy auto-derived naming
+}
+
+message PromotePrimaryKeyOperation {
+  string new_key = 1; // base64-encoded key to move to the primary (first) position
+  string key_name = 2; // when supplied, verifies the stored identity; never renames a live key
+}
+
+message RemoveOldKeysOperation {
+  string primary_key = 1; // the key to retain; all other keys are removed
+  string key_name = 2; // when supplied, verifies the retained storage identity
+}
+
+message UpdateEncryptionConfigRequest {
+  oneof operation {
+    AddSecondaryKeyOperation add_secondary_key = 1;
+    PromotePrimaryKeyOperation promote_primary_key = 2;
+    RemoveOldKeysOperation remove_old_keys = 3;
+  }
+}
+
+// UpdateEncryptionConfigResponse is empty on success. On failure the gRPC
+// status code follows the UpdateEncryptionConfig contract; a written WAL entry
+// is retained for a retry of the same operation.
+message UpdateEncryptionConfigResponse {}
+
+message GetEtcdEncryptionKeyIdentityRequest {
+  // SHA-256 of the base64 key string, lowercase hex. The raw key is never returned.
+  string key_sha256 = 1;
+}
+
+message GetEtcdEncryptionKeyIdentityResponse {
+  // Empty if this key has not yet been distributed to this node.
+  string key_name = 1;
+}
+
+enum EtcdEncryptionAtRestObjectsRewriteState {
+  ETCD_ENCRYPTION_AT_REST_OBJECTS_REWRITE_STATE_UNSPECIFIED = 0;
+  ETCD_ENCRYPTION_AT_REST_OBJECTS_REWRITE_STATE_RUNNING = 1;
+  ETCD_ENCRYPTION_AT_REST_OBJECTS_REWRITE_STATE_SUCCEEDED = 2;
+  ETCD_ENCRYPTION_AT_REST_OBJECTS_REWRITE_STATE_FAILED = 3;
+}
+
+message EtcdEncryptionAtRestObjectsRewriteOperation {
+  string operation_id = 1;
+  EtcdEncryptionAtRestObjectsRewriteState state = 2;
+  string error_message = 3;
+}
+
+message StartEtcdEncryptionAtRestObjectsRewriteRequest {
+  string operation_id = 1;
+}
+
+message StartEtcdEncryptionAtRestObjectsRewriteResponse {
+  EtcdEncryptionAtRestObjectsRewriteOperation operation = 1;
+}
+
+message GetEtcdEncryptionAtRestObjectsRewriteStatusRequest {
+  string operation_id = 1;
+}
+
+message GetEtcdEncryptionAtRestObjectsRewriteStatusResponse {
+  EtcdEncryptionAtRestObjectsRewriteOperation operation = 1;
+}
+
+message RemovePlainTextSecondaryEncryptionEntryRequest {}
+
+message RemovePlainTextSecondaryEncryptionEntryResponse {
+  string status = 1;
+  string error_message = 2;
+}
+
+message FileChunk {
+  bytes data = 1;
+  string filename = 2;
+  string destination = 3;
+}
+
+message UploadStatus {
+  string message = 1;
+  int32 code = 2;
+}
+
+message WriteNodeAgentConfigRequest {
+  // Full UTF-8 YAML body (typically a NodeSpec for on-host reconcilers).
+  bytes config_yaml = 1;
+}
+
+message WriteNodeAgentConfigResponse {
+  string message = 1;
+  // HTTP-style code for parity with UploadStatus (e.g. 200 = success).
+  int32 code = 2;
+}
+
+message ScriptOutputChunk {
+  string output = 1;
+  string error = 2;
+  int32 exit_code = 3; // Exit code (set in final chunk)
+  bool is_complete = 4; // Indicates if this is the final chunk
+}
+
+message InstallBundleRequest {
+  string name = 1;
+  string version = 2;
+  repeated string install_args = 3;
+  bool use_staging = 5;
+  bool async = 6;
+}
+
+message InstallBundleResponse {
+  string status = 1;
+  string error_message = 2;
+  string request_id = 3;
+}
+
+message GetBundleStatusRequest {
+  string request_id = 1;
+}
+
+message BundleStatus {
+  string request_id = 1;
+  string name = 2;
+  string version = 3;
+  string status = 4;
+  string error = 5;
+  string output = 6;
+  string exit_code = 7;
+  // Type of item: "bundle" (from .json collection) or "deb-collection" (from .txt collection).
+  string item_type = 8;
+}
+
+message GetBundleStatusResponse {
+  repeated BundleStatus statuses = 1;
+}
+
+message InstallCollectionRequest {
+  string collectionURL = 1;
+  bool staging = 2;
+}
+
+message InstallCollectionResponse {
+  string request_id = 1;
+}
+
+message InstallPackagesRequest {
+  // List of packages to install.
+  // This will be passed directly to apt-get install ...
+  // Either <package> or <package=version> allowed.
+  repeated string packages = 1;
+  // Whether to call apt-get update before installing packages.
+  bool update = 2;
+  // When true, installation runs in the background; poll GetBundleStatus(request_id).
+  bool async = 3;
+}
+
+message InstallPackagesResponse {
+  string request_id = 1;
+}
+
+enum NodeAgentUpgradeMethod {
+  NODE_AGENT_UPGRADE_METHOD_UNSPECIFIED = 0;
+  NODE_AGENT_UPGRADE_METHOD_APT = 1;
+  NODE_AGENT_UPGRADE_METHOD_BUNDLE = 2;
+}
+
+enum NodeAgentUpgradePhase {
+  NODE_AGENT_UPGRADE_PHASE_UNSPECIFIED = 0;
+  NODE_AGENT_UPGRADE_PHASE_PENDING = 1;
+  NODE_AGENT_UPGRADE_PHASE_RUNNING = 2;
+  NODE_AGENT_UPGRADE_PHASE_SUCCEEDED = 3;
+  NODE_AGENT_UPGRADE_PHASE_FAILED_RESTORED = 4;
+  NODE_AGENT_UPGRADE_PHASE_FAILED_NOT_RESTORED = 5;
+}
+
+message NodeAgentUpgradeOperation {
+  string target_version = 1;
+  string previous_version = 2;
+  NodeAgentUpgradeMethod method = 3;
+  NodeAgentUpgradePhase phase = 4;
+  string step = 5;
+  string error_message = 6;
+}
+
+message StartNodeAgentUpgradeRequest {
+  // Canonical node-agent release version, for example v0.1.31.
+  string target_version = 1;
+  NodeAgentUpgradeMethod method = 2;
+}
+
+message StartNodeAgentUpgradeResponse {
+  NodeAgentUpgradeOperation operation = 1;
+}
+
+message GetNodeAgentUpgradeStatusRequest {}
+
+message GetNodeAgentUpgradeStatusResponse {
+  // Absent when no upgrade has been requested.
+  NodeAgentUpgradeOperation operation = 1;
+}
+
+message ListPackagesRequest {}
+
+message InstalledPackage {
+  // Debian package name
+  string name = 1;
+  // Package version
+  string version = 2;
+  // A 3 letter package state.
+  // See https://manpages.ubuntu.com/manpages/focal/man1/dpkg-query.1.html
+  string status = 3;
+}
+
+message ListPackagesResponse {
+  repeated InstalledPackage packages = 1;
+}
+
+message RemovePackagesRequest {
+  // List of packages to remove
+  repeated string packages = 1;
+  // Whether to remove all configs related to debian packages.
+  // This adds --purge flag to apt-get remove
+  bool purge = 2;
+}
+
+message RemovePackagesResponse {}
+
+enum KubeadmPreflightRole {
+  // Values are prefixed with the enum name so they do not register bare
+  // top-level symbols (e.g. proto.INIT) in the global protobuf registry, which
+  // collided with other packages using `package proto;` (notably Teleport's
+  // gravitational/teleport/api/client/proto). Follows the protobuf enum style
+  // guide. The numeric values are unchanged, so this is wire-compatible.
+  KUBEADM_PREFLIGHT_ROLE_INIT = 0;
+  KUBEADM_PREFLIGHT_ROLE_JOIN = 1;
+}
+
+message KubeadmPreflightRequest {
+  // Kubeadm configuration file contents (YAML)
+  string config = 1;
+  // Whether this is an init or join preflight check
+  KubeadmPreflightRole role = 2;
+}
+
+message PreflightCheckResult {
+  string name = 1;
+  // "error" or "warning"
+  string severity = 2;
+  string message = 3;
+}
+
+message KubeadmPreflightResponse {
+  // "success" if all checks passed, "error" if any check failed
+  string status = 1;
+  string error_message = 2;
+  // Individual preflight check results (errors and warnings)
+  repeated PreflightCheckResult results = 3;
+  // Raw output from kubeadm
+  string raw_output = 4;
+}
+
+message ExecuteNodePreflightRequest {
+  // Optional caller-defined node readiness checks (e.g. file_exists for sentinel files).
+  repeated NodePreflightCheck checks = 1;
+  // Optional kubeadm init/join preflight for this node.
+  optional KubeadmPreflightRequest kubeadm_preflight = 2;
+  // When set, the agent runs `cloud-init status --long` and passes when its
+  // status line reads "status: done". "status: running" yields notready;
+  // "status: error" yields error. The lines after the status line are
+  // reported, not evaluated.
+  CheckCloudInitStatus check_cloud_init_status = 3;
+}
+
+// CheckCloudInitStatus requests cloud-init bootstrap completion via `cloud-init status`.
+message CheckCloudInitStatus {}
+
+message NodePreflightCheck {
+  // Caller-defined identifier for this check (e.g. "sentinel-file").
+  // When empty, the agent derives a name from the check type and path.
+  string name = 1;
+  oneof check {
+    FileExistsPreflightCheck file_exists = 2;
+  }
+}
+
+message FileExistsPreflightCheck {
+  // Absolute path on the node filesystem.
+  string path = 1;
+}
+
+message ExecuteNodePreflightResponse {
+  // "ready" when all requested checks passed, "notready" when a node check failed,
+  // "error" when kubeadm preflight failed or the request was invalid.
+  // Invalid requests return gRPC OK with status = "error" and error_message set.
+  string status = 1;
+  repeated NodePreflightResult results = 2;
+  KubeadmPreflightResponse kubeadm_preflight = 3;
+  // Human-readable summary of what failed when status is "notready" or "error".
+  // Empty when status is "ready".
+  string error_message = 4;
+}
+
+message NodePreflightResult {
+  string name = 1;
+  bool passed = 2;
+  string message = 3;
+}
+
+message ConfigureAptRepoRequest {
+  // Used in apt preferences Pin: release o=<repo_name> when repo_priority is non-zero.
+  // Should match the Origin field in the repository InRelease/Release file.
+  string repo_name = 1;
+  string repo_signing_key = 2;
+  int32 repo_priority = 3;
+  // Basename for the keyring file (no directories, no ".gpg" suffix). The agent writes
+  // /etc/apt/keyrings/<keyring_name>.gpg so callers can set signed-by= to match upstream docs.
+  string keyring_name = 4;
+  // Repository root URL for the deb line (e.g. https://bucket.s3.region.amazonaws.com/nke-apt-dev).
+  // Required together with suite; the agent writes /etc/apt/sources.list.d/<file>.list.
+  string deb_uri = 5;
+  // Suite/codename (e.g. noble, jammy).
+  string suite = 6;
+  // Space-separated components (e.g. "main"). If empty, defaults to "main".
+  string components = 7;
+  // Optional basename for the sources list file (must end with .list). If empty, uses <keyring_name>.list.
+  string sources_list_basename = 8;
+}
+
+message ConfigureAptRepoResponse {
+  string status = 1;
+  string error_message = 2;
+  string raw_output = 3;
+}
+
+message RemoveAptRepoRequest {
+  // Same keyring_name as passed to ConfigureAptRepo.
+  string keyring_name = 1;
+  // Basename under /etc/apt/sources.list.d (must end with .list). If empty, the agent
+  // removes <keyring_name>.list when present.
+  string sources_list_basename = 2;
+}
+
+message RemoveAptRepoResponse {
+  string status = 1;
+  string error_message = 2;
+  string raw_output = 3;
+}
+
+message StartKubeVipRestoreRequest {
+  string operation_id = 1;
+}
+
+message StartKubeVipRestoreResponse {
+  NodeAgentOperationStatus operation = 1;
+}
+
+message ScheduleNodeRebootRequest {}
+
+message ScheduleNodeRebootResponse {
+  // True when package-manager locks remained held for the full wait period.
+  // The reboot is still scheduled in this case.
+  bool package_locks_timed_out = 1;
+}
+
+message GetNodeBootInfoRequest {}
+
+message GetNodeBootInfoResponse {
+  // UTC Unix timestamp, in seconds, for when the current boot began.
+  int64 boot_time_unix_seconds = 1;
+
+  // Linux boot ID when available.
+  string boot_id = 2;
+}
+
+message ReconfigureKubeletAPIServerRequest {
+  // Kubernetes API endpoint in the exact form https://<host-or-ip>:6443.
+  string server = 1;
+}
+
+message ReconfigureKubeletAPIServerResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // kubelet.conf changed and kubelet was restarted and verified active.
+    OUTCOME_APPLIED = 1;
+    // kubelet.conf already contained the requested endpoint; it was not
+    // rewritten, and kubelet was restarted and verified active.
+    OUTCOME_UNCHANGED = 2;
+    // Reconfiguration failed after mutation, but the original kubelet.conf was
+    // restored and kubelet was verified active with the original config.
+    OUTCOME_FAILED_RESTORED = 3;
+    // Reconfiguration failed and restoration could not be confirmed. The node
+    // needs retry or operator intervention.
+    OUTCOME_FAILED_NOT_RESTORED = 4;
+  }
+
+  Outcome outcome = 1;
+  // Populated only on FAILED_* outcomes.
+  string error_message = 2;
+}
+
+message ReconfigureSpireAgentRequest {
+  // SPIRE server host name or IP address the agent dials.
+  string server_address = 1;
+  // SPIRE server port, 1-65535.
+  uint32 server_port = 2;
+}
+
+message ReconfigureSpireAgentResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // spire-agent was restarted and serves an SVID issued after the restart.
+    // The config was rewritten if it pointed at another server.
+    OUTCOME_APPLIED = 1;
+    // The config already pointed at the requested server and the agent holds a
+    // valid SVID from it; the agent was not restarted.
+    OUTCOME_UNCHANGED = 2;
+    // The agent did not serve an SVID from the requested server in time. The
+    // config is left pointing at the requested server.
+    OUTCOME_FAILED = 3;
+  }
+
+  Outcome outcome = 1;
+  // Populated only on OUTCOME_FAILED.
+  string error_message = 2;
+}
+
+message GetSpireAgentStatusRequest {}
+
+message GetSpireAgentStatusResponse {
+  // server_address and server_port as written in the agent config.
+  string server_address = 1;
+  uint32 server_port = 2;
+  // spire-agent is active and was started after the config was last written,
+  // so the running agent uses the config above.
+  bool config_applied = 3;
+  // config_applied and the agent serves an unexpired X.509 SVID. SVIDs live
+  // only in the running agent's memory, so this SVID came from the server
+  // above.
+  bool has_valid_svid = 4;
+  // SPIFFE ID and expiry (UTC Unix seconds) of that SVID, when one is served.
+  string svid_spiffe_id = 5;
+  int64 svid_expires_at_unix_seconds = 6;
+  // Why has_valid_svid is false, when it is.
+  string message = 7;
+}
+
+message KubeadmUpgradeApplyRequest {
+  // Semantic Kubernetes version without a leading "v", for example 1.34.2.
+  string target_version = 1;
+}
+
+message KubeadmUpgradeApplyResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    OUTCOME_APPLIED = 1;
+  }
+
+  Outcome outcome = 1;
+  // Canonical Kubernetes version with a leading "v".
+  string target_version = 2;
+  string plan_output = 3;
+  string apply_output = 4;
+}
+
+message ReconcileKubeVipRequest {
+  enum BGPPeerASNSource {
+    BGP_PEER_ASN_SOURCE_UNSPECIFIED = 0;
+    // Use bgp_peer_asn from this request.
+    BGP_PEER_ASN_SOURCE_STATIC = 1;
+    // Resolve the peer ASN from the Forge Metadata Service on the node.
+    BGP_PEER_ASN_SOURCE_FMDS = 2;
+  }
+
+  // IPv4 control-plane virtual IP advertised as a /32.
+  string vip_address = 1;
+  // Local kube-vip BGP ASN.
+  uint32 bgp_asn = 2;
+  // IPv4 address used as the BGP router ID and source-interface lookup.
+  string node_ip = 3;
+  BGPPeerASNSource bgp_peer_asn_source = 4;
+  // Required when bgp_peer_asn_source is STATIC; ignored for FMDS.
+  uint32 bgp_peer_asn = 5;
+  // Optional explicit IPv4 peer address. When empty, the default gateway is
+  // used, matching the legacy runbook.
+  string bgp_peer_address = 6;
+  // Optional absolute FMDS ASN endpoint. When empty, the legacy Forge endpoint
+  // is used. Ignored unless bgp_peer_asn_source is FMDS.
+  string fmds_endpoint = 7;
+}
+
+message ReconcileKubeVipResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    OUTCOME_CREATED = 1;
+    OUTCOME_UPDATED = 2;
+    OUTCOME_UNCHANGED = 3;
+  }
+
+  Outcome outcome = 1;
+  string manifest_path = 2;
+  string bgp_interface = 3;
+  string bgp_peer_address = 4;
+  uint32 bgp_peer_asn = 5;
+  // Credential-less kubeconfig mounted read-only at kube-vip v1.2.0's
+  // compatibility path. It contains no token or client private key.
+  string kubeconfig_path = 6;
+  // Interfaces from which a stale copy of vip_address was removed.
+  repeated string cleaned_interfaces = 7;
+  // True when the credential-less kubeconfig was created or repaired.
+  bool kubeconfig_changed = 8;
+}
+
+message StartKubernetesCertificateRenewalRequest {
+  // Stable caller-provided idempotency key.
+  string operation_id = 1;
+  // Renew certificates whose residual lifetime is less than this many days.
+  int32 threshold_days = 2;
+}
+
+message StartKubernetesCertificateRenewalV2Request {
+  // Stable caller-provided idempotency key.
+  string operation_id = 1;
+  // Renew certificates whose residual lifetime is less than this many days.
+  int32 threshold_days = 2;
+  // Renew all kubeadm-managed leaf certificates regardless of residual lifetime.
+  bool force = 3;
+  // Expected positive number of voting etcd members.
+  int32 expected_etcd_members = 4;
+}
+
+message StartKubernetesCertificateRenewalResponse {
+  KubernetesCertificateRenewalOperation operation = 1;
+}
+
+message StartKubernetesCertificateRenewalV2Response {
+  KubernetesCertificateRenewalOperation operation = 1;
+}
+
+message GetKubernetesCertificateRenewalStatusRequest {
+  string operation_id = 1;
+}
+
+message GetKubernetesCertificateRenewalStatusResponse {
+  KubernetesCertificateRenewalOperation operation = 1;
+}
+
+message KubernetesCertificateRenewalOperation {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // No certificate was inside the requested renewal window.
+    OUTCOME_UNCHANGED = 1;
+    // Certificates were renewed and all static control-plane pods restarted.
+    OUTCOME_RENEWED = 2;
+    // The operation failed before static-pod manifests were moved.
+    OUTCOME_FAILED_BEFORE_RESTART = 3;
+    // The operation failed after manifests were moved, but all manifests were restored.
+    OUTCOME_FAILED_RESTORED = 4;
+    // The operation failed and one or more manifests could not be restored.
+    OUTCOME_FAILED_NOT_RESTORED = 5;
+  }
+
+  NodeAgentOperationStatus operation = 1;
+  Outcome outcome = 2;
+}
+
+message RemoveEtcdMemberRequest {
+  // target accepts an etcd member name or hexadecimal member ID.
+  string target = 1;
+}
+
+message RemoveEtcdMemberResponse {}
+
+message GetEtcdStatusRequest {}
+
+message GetEtcdStatusResponse {
+  // Backend file size on disk. StatusResponse.DbSize, equivalently the
+  // etcd_mvcc_db_total_size_in_bytes metric.
+  int64 db_total_size_bytes = 1;
+  // Live data actually in use. StatusResponse.DbSizeInUse, equivalently the
+  // etcd_mvcc_db_total_size_in_use_in_bytes metric.
+  int64 db_total_size_in_use_bytes = 2;
+  // Space defragmentation could reclaim: db_total_size - db_total_size_in_use.
+  // Gate remediation on this, not on db_total_size.
+  int64 reclaimable_bytes = 3;
+  // The effective backend quota, so a caller can express thresholds as a
+  // fraction of quota rather than an absolute size.
+  //
+  // Source precedence: StatusResponse.DbSizeQuota when the server reports a
+  // nonzero value, otherwise the --quota-backend-bytes flag from the
+  // static-pod manifest. etcd only began reporting DbSizeQuota in 3.6, so on
+  // etcd 3.5 (Kubernetes <= 1.33) the manifest is the live source. A nonzero
+  // value therefore does not imply the flag is set, and this field must not be
+  // used to infer manifest contents.
+  //
+  // Zero means neither source supplied a quota, so etcd's built-in default
+  // applies and the real value is unknown to the agent. Callers must treat
+  // zero as "unknown" and decline to act, not divide by it: a ratio computed
+  // against zero would make every member look infinitely over threshold and
+  // trigger remediation fleet-wide.
+  int64 quota_backend_bytes = 4;
+  // True when the local member is the cluster leader. Reported for visibility
+  // and member ordering; StartEtcdDefrag transfers leadership away itself, so
+  // a caller does not have to act on this before requesting a defragmentation.
+  bool is_leader = 5;
+  // Voting (non-learner) members REGISTERED in the cluster. This is membership,
+  // not liveness: an offline voter is still counted, so this must not be used
+  // on its own to decide a restart is safe. StartEtcdDefrag probes each member
+  // separately and gates on how many answer.
+  int32 voting_member_count = 6;
+  // Hexadecimal ID of the local member.
+  string member_id = 7;
+  // Whether the local member is answering, can see a leader, and is carrying no
+  // alarm OF ITS OWN. Alarms are cluster-wide - the store is replicated by raft,
+  // so every member reports the whole set and only the member ID attached to an
+  // alarm says who raised it. A member here reads healthy while a peer is in
+  // NOSPACE, which is deliberate: that is the member a caller can still
+  // defragment.
+  bool healthy = 8;
+  // The bootstrap-defrag threshold this member is configured with, read from
+  // --bootstrap-defrag-threshold-megabytes in the static-pod manifest and
+  // converted to bytes. etcd evaluates it only at startup, so it is what
+  // decides whether restarting this member defragments anything.
+  //
+  // ZERO MEANS A RESTART WOULD DEFRAGMENT NOTHING, at any size: the flag is
+  // absent, or set to zero or less, which etcd treats as disabled. A caller
+  // must skip such a member rather than restart it, and StartEtcdDefrag
+  // refuses it for the same reason. This is how a node provisioned before the
+  // threshold was configured identifies itself, so a caller can leave it alone
+  // without having to call StartEtcdDefrag to be told no.
+  //
+  // Compare it against reclaimable_bytes to predict the outcome: below the
+  // threshold etcd declines to defragment and the restart is pure downtime.
+  // Note that clearing the threshold only means the restart WOULD defragment,
+  // not that it SHOULD - a member sitting a little over its threshold is the
+  // normal steady state, not a problem to remediate.
+  int64 bootstrap_defrag_threshold_bytes = 9;
+}
+
+message StartEtcdDefragRequest {
+  // Idempotency key. Retrying with the same value returns the in-flight or
+  // completed operation rather than restarting etcd again.
+  string operation_id = 1;
+}
+
+message StartEtcdDefragResponse {
+  NodeAgentOperationStatus operation = 1;
+}
+
+message GetEtcdDefragStatusRequest {
+  string operation_id = 1;
+}
+
+message GetEtcdDefragStatusResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // etcd restarted, came back healthy, and reclaimed space.
+    OUTCOME_RECLAIMED = 1;
+    // etcd restarted and came back healthy but reclaimed nothing: the backend
+    // was no smaller afterwards. Usually that means it is mostly live data,
+    // which defragmentation cannot shrink, so callers should surface this
+    // rather than loop. Note it also covers a backend that grew between the two
+    // measurements, so a defragmentation outrun by incoming writes reports the
+    // same thing as one that found nothing to reclaim.
+    OUTCOME_NOT_RECLAIMED = 2;
+    // A precondition failed and etcd was never restarted, so the node is
+    // untouched: the local member was unhealthy, too few voting members
+    // answered a probe to keep a quorum through the restart, leadership could
+    // not be transferred away to a reachable member, or
+    // reclaimable_bytes was below the manifest's configured bootstrap-defrag
+    // threshold so the restart could not have reclaimed anything.
+    //
+    // The quorum floor is a property of the cluster rather than a caller
+    // setting: the agent probes each voting member and requires
+    // registered_voters/2 + 2 of them to answer, which is one more than the
+    // quorum that has to survive this member going down. One- and two-member
+    // clusters need more voters than they have, so they are refused on every
+    // call.
+    OUTCOME_REFUSED = 3;
+    // The node is still out of service and needs intervention. Either etcd was
+    // restarted and did not return healthy - in which case kube-apiserver and
+    // kube-vip are deliberately left parked, because an apiserver with no etcd
+    // behind it is worse than one fewer endpoint - or the agent could not
+    // confirm the node back in service afterwards.
+    OUTCOME_FAILED_NOT_RESTORED = 4;
+    // The sequence failed after the node was taken out of service, but it was
+    // put back and the local member verified healthy again. No defragmentation
+    // happened and the node is in its pre-call state, so a rollout may stop
+    // cleanly rather than treating this member as damaged.
+    OUTCOME_FAILED_RESTORED = 5;
+  }
+  NodeAgentOperationStatus operation = 1;
+  Outcome outcome = 2;
+  string error_message = 3;
+  int64 db_total_size_bytes_before = 4;
+  int64 db_total_size_bytes_after = 5;
+  int64 reclaimed_bytes = 6;
+}
+
+message OpenVSwitchReconciliationResult {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    OUTCOME_CONFIGURED = 1;
+    OUTCOME_UNCHANGED = 2;
+  }
+
+  enum NetworkBackend {
+    NETWORK_BACKEND_UNSPECIFIED = 0;
+    NETWORK_BACKEND_NETPLAN = 1;
+    NETWORK_BACKEND_IFUPDOWN = 2;
+  }
+
+  Outcome outcome = 1;
+  string bridge_name = 2;
+  string uplink_interface = 3;
+  NetworkBackend network_backend = 4;
+}
+
+message StartOpenVSwitchReconciliationRequest {
+  string operation_id = 1;
+}
+
+message StartOpenVSwitchReconciliationResponse {
+  OpenVSwitchReconciliationOperation operation = 1;
+}
+
+message GetOpenVSwitchReconciliationStatusRequest {
+  string operation_id = 1;
+}
+
+message GetOpenVSwitchReconciliationStatusResponse {
+  OpenVSwitchReconciliationOperation operation = 1;
+}
+
+message OpenVSwitchReconciliationOperation {
+  NodeAgentOperationStatus operation = 1;
+  // Populated after a successful reconciliation.
+  OpenVSwitchReconciliationResult result = 2;
+}
+
+message InspectKubernetesCertificatesRequest {
+  bool control_plane = 1;
+}
+
+message KubernetesCertificateObservation {
+  string credential = 1;
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_AVAILABLE = 1;
+    STATE_MISSING = 2;
+    STATE_INVALID = 3;
+  }
+  State state = 2;
+  int64 not_after_unix_seconds = 3;
+  // SHA-256 of the public DER certificate with the earliest expiration.
+  string certificate_sha256 = 4;
+}
+
+message InspectKubernetesCertificatesResponse {
+  repeated KubernetesCertificateObservation certificates = 1;
+}

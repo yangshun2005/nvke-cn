@@ -1,0 +1,1121 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
+
+	"github.com/google/uuid"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/dsx-ai-factory/nvke/controller/api"
+	"github.com/dsx-ai-factory/nvke/controller/internal/capi"
+	"github.com/dsx-ai-factory/nvke/controller/internal/clients"
+	"github.com/dsx-ai-factory/nvke/controller/internal/clients/nico"
+	"github.com/dsx-ai-factory/nvke/controller/internal/config"
+	"github.com/dsx-ai-factory/nvke/controller/internal/constants"
+	"github.com/dsx-ai-factory/nvke/controller/internal/db"
+	"github.com/dsx-ai-factory/nvke/controller/internal/naming"
+	"github.com/dsx-ai-factory/nvke/controller/internal/nodes"
+	"github.com/dsx-ai-factory/nvke/controller/internal/otelx"
+)
+
+var (
+	errClusterNotFound                = nodes.ErrClusterNotFound
+	errClusterDeleting                = nodes.ErrClusterDeleting
+	errNodePoolDeleting               = nodes.ErrNodePoolDeleting
+	errNodeDeleting                   = nodes.ErrNodeDeleting
+	errControlPlaneNodePoolNotAllowed = errors.New("control-plane node pools are not allowed; configure the control plane via the cluster-level controlPlaneConfig")
+)
+
+type badRequestError struct {
+	message         string
+	rejectionReason string
+}
+
+func (e *badRequestError) Error() string {
+	return e.message
+}
+
+func newBadRequestErrorf(format string, args ...any) error {
+	return &badRequestError{message: fmt.Sprintf(format, args...)}
+}
+
+func newClassifiedBadRequestErrorf(reason, format string, args ...any) error {
+	return &badRequestError{
+		message:         fmt.Sprintf(format, args...),
+		rejectionReason: reason,
+	}
+}
+
+type nodePoolService struct {
+	logger                           *slog.Logger
+	db                               db.DB
+	teleportCfg                      config.TeleportConfig
+	providers                        providerSupport
+	allowlistedLabelKeys             []string
+	machineAllowlistedLabelKeys      []string
+	machineAllowlistedAnnotationKeys []string
+	// nodeAgentProfile carries the node-agent settings nodes.PinAgentProfile
+	// stamps on every node this deployment creates.
+	nodeAgentProfile db.Node
+	releaseReader    ctrlclient.Reader
+}
+
+func NewNodePoolService(
+	logger *slog.Logger,
+	database db.DB,
+	teleportCfg config.TeleportConfig,
+	supportedInfraProviders []string,
+) *nodePoolService {
+	return &nodePoolService{
+		logger:      logger,
+		db:          database,
+		teleportCfg: teleportCfg,
+		providers:   newProviderSupport(supportedInfraProviders),
+	}
+}
+
+// applyNodePoolDefaults fills in server-side defaults for omitted node pool fields
+// based on the pool's role (control plane vs worker) and infrastructure type.
+func (s *nodePoolService) applyNodePoolDefaults(req *api.CreateNodePoolRequest, cluster db.Cluster) {
+	if req.TeleportEnabled == nil {
+		v := s.teleportCfg.NodePoolTeleportDefault(req.ControlPlane)
+		req.TeleportEnabled = &v
+	}
+	// The stored pool is built from the nested payload, so the default has to land
+	// there; validation has already required nico for a Forge pool.
+	if !clusterIsCAPIBacked(cluster) && req.Nico != nil && req.Nico.DiskSelectionStrategy == "" {
+		req.Nico.DiskSelectionStrategy = api.DiskSelectionStrategyCreateSmallest
+	}
+}
+
+func (s *nodePoolService) ListNodePools(ctx context.Context, req api.ListNodePoolsRequestObject) (api.ListNodePoolsResponseObject, error) {
+	filters := db.NodePoolFilters{
+		ClusterID:   req.Params.ClusterID,
+		Name:        req.Params.Name,
+		ClusterName: req.Params.ClusterName,
+	}
+
+	dbNodePools, err := s.db.ListNodePools(ctx, filters)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list node pools: %w", err)
+	}
+	apiNodePools := make([]api.NodePool, len(dbNodePools))
+	for i := range dbNodePools {
+		apiNodePools[i] = apiNodePoolFromDB(&dbNodePools[i])
+	}
+	return api.ListNodePools200JSONResponse{NodePools: apiNodePools}, nil
+}
+
+func (s *nodePoolService) CreateNodePool(
+	ctx context.Context,
+	req api.CreateNodePoolRequestObject,
+) (api.CreateNodePoolResponseObject, error) {
+	cluster, err := s.db.GetCluster(ctx, req.Body.ClusterID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return api.CreateNodePool400JSONResponse{Message: "Cluster not found"}, nil
+		}
+		return nil, fmt.Errorf("failed to get cluster: %w", err)
+	}
+
+	if req.Body.ControlPlane {
+		return api.CreateNodePool400JSONResponse{Message: errControlPlaneNodePoolNotAllowed.Error()}, nil
+	}
+
+	if err := s.validateCreateNodePoolRequest(cluster, req.Body); err != nil {
+		return api.CreateNodePool400JSONResponse{Message: err.Error()}, nil
+	}
+	if err := s.validateCreateNodePoolRelease(ctx, req.Body); err != nil {
+		var badRequestErr *badRequestError
+		if errors.As(err, &badRequestErr) {
+			return api.CreateNodePool400JSONResponse{Message: badRequestErr.Error()}, nil
+		}
+		return nil, err
+	}
+
+	var createdNodePool db.NodePool
+	err = s.db.RunInTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		cluster, err := tx.GetClusterForUpdate(ctx, req.Body.ClusterID)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return errClusterNotFound
+			}
+			return fmt.Errorf("failed to get cluster: %w", err)
+		}
+
+		if cluster.Conditions.Deleting.Status == db.ConditionStatusTrue {
+			return errClusterDeleting
+		}
+
+		s.applyNodePoolDefaults(req.Body, cluster)
+		dbNodePool, err := dbNodePoolFromAPI(req.Body, cluster.KubernetesVersion)
+		if err != nil {
+			return fmt.Errorf("failed to convert node pool request: %w", err)
+		}
+		clusterID := cluster.ID
+		nodePools, err := tx.ListNodePools(ctx, db.NodePoolFilters{ClusterID: &clusterID})
+		if err != nil {
+			return fmt.Errorf("failed to list node pools for pod CIDR capacity validation: %w", err)
+		}
+		nodePools = append(nodePools, dbNodePool)
+		if err := validateStoredPodCIDRCapacity(cluster, podCIDRNodePoolsWithClusterCP(cluster, nodePools)); err != nil {
+			return newBadRequestErrorf("%s", err)
+		}
+
+		createdNodePool, err = tx.CreateNodePool(ctx, &dbNodePool)
+		if err != nil {
+			return fmt.Errorf("failed to create node pool: %w", err)
+		}
+
+		workflowID := constants.ProvisionNodePoolWorkflowPrefix + createdNodePool.ID.String()
+		err = enqueueWorkflow(ctx, tx, otelx.WorkflowAttributes{
+			WorkflowType: "ProvisionNodePool",
+			WorkflowID:   workflowID,
+			ClusterID:    cluster.ID,
+			ClusterName:  cluster.Name,
+			NodePoolID:   createdNodePool.ID,
+			NodePoolName: createdNodePool.Name,
+		}, map[string]interface{}{
+			nodePoolIDConst: createdNodePool.ID,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create workflow outbox entry: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		var badRequestErr *badRequestError
+		if errors.As(err, &badRequestErr) {
+			return api.CreateNodePool400JSONResponse{Message: badRequestErr.Error()}, nil
+		}
+		if errors.Is(err, errClusterDeleting) {
+			return api.CreateNodePool409JSONResponse{Message: "Cannot create node pool when parent cluster is deleting"}, nil
+		}
+		if errors.Is(err, errClusterNotFound) {
+			return api.CreateNodePool400JSONResponse{Message: "Parent cluster not found"}, nil
+		}
+		if errors.Is(err, db.ErrNodePoolNameNotUniqueInCluster) {
+			return api.CreateNodePool400JSONResponse{
+				Message: fmt.Sprintf("A node pool already exists with the name %q in cluster ID %q", req.Body.Name, req.Body.ClusterID),
+			}, nil
+		}
+		return nil, err
+	}
+
+	return api.CreateNodePool201JSONResponse(apiNodePoolFromDB(&createdNodePool)), nil
+}
+
+func clusterIsCAPIBacked(cluster db.Cluster) bool {
+	return cluster.ProviderType == db.ProviderTypeCAPI
+}
+
+func validateCloudInitFiles(files []api.CloudInitFile) error {
+	seenPaths := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		if file.Path == "" {
+			return fmt.Errorf("file path is required")
+		}
+		if file.Content == "" {
+			return fmt.Errorf("file content is required for path %q", file.Path)
+		}
+		switch file.Path {
+		case constants.CAPISpireAgentConfigPath, constants.CAPISpireTrustBundlePath:
+			return fmt.Errorf("file path %q is managed by the controller and must not be provided", file.Path)
+		}
+		if _, exists := seenPaths[file.Path]; exists {
+			return fmt.Errorf("duplicate file path %q", file.Path)
+		}
+		seenPaths[file.Path] = struct{}{}
+	}
+	return nil
+}
+
+func (s *nodePoolService) validateCreateNodePoolRequest(cluster db.Cluster, req *api.CreateNodePoolRequest) error {
+	if err := naming.ValidateNodeNamePrefix(cluster.Name, req.NodeNamePrefix); err != nil {
+		return err
+	}
+	if err := validateNodeLabels(req.NodeLabels, s.allowlistedLabelKeys); err != nil {
+		return newBadRequestErrorf("%s", err)
+	}
+	if err := validateMachineMetadata(req.MachineAnnotations, req.MachineLabels, s.machineAllowlistedAnnotationKeys, s.machineAllowlistedLabelKeys); err != nil {
+		return newBadRequestErrorf("%s", err)
+	}
+	if err := validateNodeTaints(req.NodeTaints, req.ControlPlane); err != nil {
+		return newBadRequestErrorf("%s", err)
+	}
+	if err := s.validateCreateNodePoolProvider(cluster, req); err != nil {
+		return err
+	}
+
+	nodePool, err := dbNodePoolFromAPI(req, cluster.KubernetesVersion)
+	if err != nil {
+		return err
+	}
+	if err := validateNodeAgentProfile(s.nodeAgentProfile, cluster, nodePool); err != nil {
+		return newBadRequestErrorf("%s", err)
+	}
+	return nil
+}
+
+func (s *nodePoolService) validateCreateNodePoolProvider(cluster db.Cluster, req *api.CreateNodePoolRequest) error {
+	switch cluster.ProviderType {
+	case db.ProviderTypeCAPI:
+		if err := s.providers.require(config.InfraProviderInfra); err != nil {
+			return err
+		}
+		return validateCreateCAPINodePoolRequest(cluster, req)
+	case db.ProviderTypeNico:
+		if err := s.providers.require(config.InfraProviderNico); err != nil {
+			return err
+		}
+		return validateCreateNicoNodePoolRequest(cluster, req)
+	case db.ProviderTypeLaunchLayer:
+		if err := s.providers.require(config.InfraProviderLaunchLayer); err != nil {
+			return err
+		}
+		return validateCreateLaunchLayerNodePoolRequest(cluster, req)
+	default:
+		return fmt.Errorf("unsupported cluster provider")
+	}
+}
+
+func validateCreateCAPINodePoolRequest(cluster db.Cluster, req *api.CreateNodePoolRequest) error {
+	if req.Nico != nil {
+		return fmt.Errorf("nico is not supported, please provide infra")
+	}
+	if req.Infra == nil || req.Infra.MachineTemplate == nil {
+		return fmt.Errorf("infra.machineTemplate is required")
+	}
+	if isEmptyManifestObject(req.Infra.MachineTemplate) {
+		return fmt.Errorf("infra.machineTemplate cannot be empty")
+	}
+	infraMachineTemplate, err := rawManifestFromObject(req.Infra.MachineTemplate)
+	if err != nil {
+		return fmt.Errorf("invalid infra.machineTemplate: %w", err)
+	}
+	var nodePool db.NodePool
+	nodePool.SetCapi(db.CAPINodePoolProvider{InfraMachineTemplate: infraMachineTemplate})
+	validator, err := clients.GetNodePoolPayloadValidator(cluster)
+	if err != nil {
+		return err
+	}
+	if err := validator.ValidateNodePoolPayload(nodePool); err != nil {
+		return fmt.Errorf("invalid infra.machineTemplate: %w", err)
+	}
+	if err := validateCloudInitFiles(req.Infra.BootstrapFiles); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateCreateNicoNodePoolRequest(cluster db.Cluster, req *api.CreateNodePoolRequest) error {
+	if req.Infra != nil {
+		return fmt.Errorf("infra is not supported, please provide nico")
+	}
+	if req.Nico == nil {
+		return fmt.Errorf("nico is required when creating a node pool on a nico cluster")
+	}
+
+	if req.Nico.InstanceTypeID == uuid.Nil {
+		return fmt.Errorf("nico.instanceTypeID is required when creating a nico node pool")
+	}
+
+	if req.Nico.Release == "" {
+		return fmt.Errorf("nico.release is required when creating a nico node pool")
+	}
+
+	var nodePool db.NodePool
+	nodePool.SetNico(db.NicoNodePoolProvider{
+		SubnetIDs:             req.Nico.SubnetIDs,
+		VpcPrefixIDs:          req.Nico.VpcPrefixIDs,
+		DiskSelectionStrategy: db.DiskSelectionStrategy(req.Nico.DiskSelectionStrategy),
+	})
+	validator, err := clients.GetNodePoolPayloadValidator(cluster)
+	if err != nil {
+		return err
+	}
+	return validator.ValidateNodePoolPayload(nodePool)
+}
+
+func validateCreateLaunchLayerNodePoolRequest(cluster db.Cluster, req *api.CreateNodePoolRequest) error {
+	if req.Nico != nil {
+		return fmt.Errorf("nico is not supported, please provide launchLayer")
+	}
+	if req.Infra != nil {
+		return fmt.Errorf("infra is not supported, please provide launchLayer")
+	}
+	if req.LaunchLayer == nil {
+		return fmt.Errorf("launchLayer is required when creating a node pool on a launchLayer cluster")
+	}
+
+	var nodePool db.NodePool
+	nodePool.SetLaunchLayer(dbLaunchLayerNodePoolProviderFromAPI(*req.LaunchLayer))
+	validator, err := clients.GetNodePoolPayloadValidator(cluster)
+	if err != nil {
+		return err
+	}
+	if err := validator.ValidateNodePoolPayload(nodePool); err != nil {
+		return err
+	}
+	clusterProvider, err := cluster.LaunchLayerProvider()
+	if err != nil {
+		return err
+	}
+	return validateLaunchLayerSecurityGroupRefs(req.LaunchLayer.SecurityGroupRefs, clusterProvider.SecurityGroups, "launchLayer")
+}
+
+// validateLaunchLayerSecurityGroupRefs rejects a securityGroupRefs name that
+// is not one of groups, the cluster's managed security groups; CAPLL would
+// otherwise fail on it after the request was accepted.
+func validateLaunchLayerSecurityGroupRefs(refs *api.LaunchLayerSecurityGroupRefs, groups []db.LaunchLayerSecurityGroup, fieldPrefix string) error {
+	if refs == nil {
+		return nil
+	}
+	for _, name := range slices.Concat(refs.PrimaryNetworkInterface, refs.GpuNetworkInterface) {
+		if !slices.ContainsFunc(groups, func(group db.LaunchLayerSecurityGroup) bool { return group.Name == name }) {
+			return fmt.Errorf("%s.securityGroupRefs: %q is not one of the cluster's launchLayer.securityGroups", fieldPrefix, name)
+		}
+	}
+	return nil
+}
+
+func dbLaunchLayerNodePoolProviderFromAPI(provider api.LaunchLayerNodePoolProvider) db.LaunchLayerNodePoolProvider {
+	out := db.LaunchLayerNodePoolProvider{
+		InstanceType:  provider.InstanceType,
+		HostOSProfile: provider.HostOSProfile,
+		VMProfile:     provider.VMProfile,
+	}
+	if provider.FulfillmentStrategy != nil {
+		out.FulfillmentStrategy = string(*provider.FulfillmentStrategy)
+	}
+	if provider.SecurityGroupRefs != nil {
+		out.SecurityGroupRefs = db.LaunchLayerSecurityGroupRefs{
+			PrimaryNetworkInterface: provider.SecurityGroupRefs.PrimaryNetworkInterface,
+			GPUNetworkInterface:     provider.SecurityGroupRefs.GpuNetworkInterface,
+		}
+	}
+	if provider.SecurityGroups != nil {
+		out.SecurityGroups = db.LaunchLayerSecurityGroups{
+			PrimaryNetworkInterface: provider.SecurityGroups.PrimaryNetworkInterface,
+			GPUNetworkInterface:     provider.SecurityGroups.GpuNetworkInterface,
+		}
+	}
+	return out
+}
+
+func (s *nodePoolService) GetNodePool(ctx context.Context, req api.GetNodePoolRequestObject) (api.GetNodePoolResponseObject, error) {
+	dbNodePool, err := s.db.GetNodePool(ctx, req.NodePoolID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return api.GetNodePool404Response{}, nil
+		}
+		return nil, fmt.Errorf("failed to get node pool: %w", err)
+	}
+
+	return api.GetNodePool200JSONResponse(apiNodePoolFromDB(&dbNodePool)), nil
+}
+
+func (s *nodePoolService) DeleteNodePool(
+	ctx context.Context,
+	req api.DeleteNodePoolRequestObject,
+) (api.DeleteNodePoolResponseObject, error) {
+	err := s.db.RunInTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		return nodes.DeleteNodePoolWithTx(ctx, tx, req.NodePoolID)
+	})
+	if err != nil {
+		if errors.Is(err, errClusterDeleting) || errors.Is(err, errNodePoolDeleting) {
+			// Teardown already in progress via cluster delete or a prior pool delete.
+			return api.DeleteNodePool202Response{}, nil
+		}
+		if errors.Is(err, db.ErrControlPlaneMutationBlocked) {
+			return api.DeleteNodePool409JSONResponse{Message: err.Error()}, nil
+		}
+		if errors.Is(err, nodes.ErrLastJoinedControlPlaneNodePool) {
+			return api.DeleteNodePool400JSONResponse{Message: err.Error()}, nil
+		}
+		if errors.Is(err, db.ErrNotFound) || errors.Is(err, errClusterNotFound) {
+			return api.DeleteNodePool404Response{}, nil
+		}
+		return nil, err
+	}
+
+	return api.DeleteNodePool202Response{}, nil
+}
+
+func (s *nodePoolService) UpdateNodePool(
+	ctx context.Context,
+	req api.UpdateNodePoolRequestObject,
+) (api.UpdateNodePoolResponseObject, error) {
+	var updatedNodePool db.NodePool
+	err := s.db.RunInTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		// Re-read the pool without a lock first, solely to learn its cluster, then
+		// lock the cluster before the node-pool row. This matches the global
+		// cluster-first lock order (see internal/nodes/control_plane_delete.go)
+		// so this update cannot deadlock with the live-delete guards or the
+		// control-plane reconcile transaction.
+		unlockedNodePool, err := tx.GetNodePool(ctx, req.NodePoolID)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return err
+			}
+			return fmt.Errorf("failed to get node pool: %w", err)
+		}
+
+		cluster, err := tx.GetClusterForUpdate(ctx, unlockedNodePool.ClusterID)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return errClusterNotFound
+			}
+			return fmt.Errorf("failed to get cluster: %w", err)
+		}
+
+		dbNodePool, err := tx.GetNodePoolForUpdate(ctx, req.NodePoolID)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				return err
+			}
+			return fmt.Errorf("failed to get node pool: %w", err)
+		}
+
+		if dbNodePool.Conditions.Deleting.Status == db.ConditionStatusTrue {
+			return errNodePoolDeleting
+		}
+
+		// Never accepted, lock or not, so the lock's retry advice does not apply.
+		if dbNodePool.ControlPlane {
+			return &badRequestError{message: errControlPlaneNodePoolNotAllowed.Error()}
+		}
+		capacityCanIncrease := req.Body != nil &&
+			(req.Body.DesiredNodeCount != nil || req.Body.MaxSurge != nil)
+		var nodePools []db.NodePool
+		previousRequiredNodeBlocks := 0
+		if capacityCanIncrease {
+			clusterID := cluster.ID
+			nodePools, err = tx.ListNodePools(ctx, db.NodePoolFilters{ClusterID: &clusterID})
+			if err != nil {
+				return fmt.Errorf("failed to list node pools for pod CIDR capacity validation: %w", err)
+			}
+			previousRequiredNodeBlocks = requiredPodCIDRNodeBlocks(podCIDRNodePoolsWithClusterCP(cluster, nodePools), cluster.ControlPlaneConfig.MaxSurge)
+		}
+
+		if err := s.validateUpdateNodePoolRequest(cluster, req.Body); err != nil {
+			return &badRequestError{message: err.Error()}
+		}
+		if err := s.validateUpdateNodePoolRelease(ctx, dbNodePool, req.Body); err != nil {
+			return err
+		}
+		if req.Body != nil && req.Body.DesiredNodeCount != nil && *req.Body.DesiredNodeCount > dbNodePool.DesiredCount {
+			if err := validateNodeAgentProfile(s.nodeAgentProfile, cluster, dbNodePool); err != nil {
+				return newBadRequestErrorf("%s", err)
+			}
+		}
+
+		if err := applyUpdateNodePoolRequest(cluster, &dbNodePool, req.Body); err != nil {
+			return err
+		}
+		if err := validateUpdatedNodePool(cluster, &dbNodePool); err != nil {
+			return err
+		}
+		if capacityCanIncrease {
+			found := false
+			for i := range nodePools {
+				if nodePools[i].ID == dbNodePool.ID {
+					nodePools[i] = dbNodePool
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("node pool %s is missing from cluster %s", dbNodePool.ID, cluster.ID)
+			}
+			augmentedNodePools := podCIDRNodePoolsWithClusterCP(cluster, nodePools)
+			if requiredPodCIDRNodeBlocks(augmentedNodePools, cluster.ControlPlaneConfig.MaxSurge) > previousRequiredNodeBlocks {
+				if err := validateStoredPodCIDRCapacity(cluster, augmentedNodePools); err != nil {
+					return newBadRequestErrorf("%s", err)
+				}
+			}
+		}
+
+		updatedNodePool, err = tx.UpdateNodePool(ctx, &dbNodePool)
+		if err != nil {
+			return fmt.Errorf("failed to update node pool: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, db.ErrControlPlaneMutationBlocked) {
+			return api.UpdateNodePool400JSONResponse{Message: err.Error()}, nil
+		}
+		var badRequestErr *badRequestError
+		if errors.As(err, &badRequestErr) {
+			return api.UpdateNodePool400JSONResponse{Message: badRequestErr.Error()}, nil
+		}
+		if errors.Is(err, db.ErrNotFound) || errors.Is(err, errClusterNotFound) {
+			return api.UpdateNodePool404Response{}, nil
+		}
+		return nil, err
+	}
+
+	return api.UpdateNodePool200JSONResponse(apiNodePoolFromDB(&updatedNodePool)), nil
+}
+
+func applyUpdateNodePoolRequest(cluster db.Cluster, dbNodePool *db.NodePool, req *api.UpdateNodePoolRequest) error {
+	if req == nil {
+		return nil
+	}
+
+	if req.AutoProvisionDisabled != nil {
+		dbNodePool.AutoProvisionDisabled = *req.AutoProvisionDisabled
+	}
+	if req.AutoModeDisabled != nil {
+		dbNodePool.AutoModeDisabled = *req.AutoModeDisabled
+	}
+	if req.ProvisioningMonitorDisabled != nil {
+		dbNodePool.ProvisioningMonitorDisabled = *req.ProvisioningMonitorDisabled
+	}
+
+	if req.Description != nil {
+		dbNodePool.Description = req.Description
+	}
+
+	if req.DesiredNodeCount != nil {
+		dbNodePool.DesiredCount = *req.DesiredNodeCount
+	}
+
+	if req.SystemReservedMemory != nil {
+		dbNodePool.SystemReservedMemory = *req.SystemReservedMemory
+	}
+	if req.KubeReservedMemory != nil {
+		dbNodePool.KubeReservedMemory = *req.KubeReservedMemory
+	}
+	if req.RecycleBudget != nil {
+		dbNodePool.RecycleBudget = *req.RecycleBudget
+	}
+	if req.MaxSurge != nil {
+		dbNodePool.MaxSurge = *req.MaxSurge
+	}
+	if req.TeleportEnabled != nil {
+		dbNodePool.TeleportEnabled = *req.TeleportEnabled
+	}
+	if req.KubernetesVersion != nil {
+		dbNodePool.KubernetesVersion = *req.KubernetesVersion
+	}
+
+	// The cluster's provider decides which payload this pool carries; the request
+	// only supplies the patch. validateUpdateNodePoolRequest has already rejected
+	// a provider shape that does not match the cluster.
+	switch cluster.ProviderType {
+	case db.ProviderTypeNico:
+		if req.Nico == nil {
+			return nil
+		}
+		nico, err := dbNodePool.NicoProvider()
+		if err != nil {
+			return err
+		}
+		if req.Nico.SubnetIDs != nil {
+			nico.SubnetIDs = uuidSliceDedupe(req.Nico.SubnetIDs)
+		}
+		if req.Nico.VpcPrefixIDs != nil {
+			nico.VpcPrefixIDs = uuidSliceDedupe(req.Nico.VpcPrefixIDs)
+		}
+		if req.Nico.Release != nil {
+			nico.Release = *req.Nico.Release
+		}
+		if req.Nico.ConfigProfile != nil {
+			nico.ConfigProfile = *req.Nico.ConfigProfile
+		}
+		if req.Nico.DiskSelectionStrategy != nil {
+			nico.DiskSelectionStrategy = db.DiskSelectionStrategy(*req.Nico.DiskSelectionStrategy)
+		}
+		dbNodePool.SetNico(nico)
+
+	case db.ProviderTypeCAPI:
+		if req.Infra == nil {
+			return nil
+		}
+		capiProvider, err := dbNodePool.CAPIProvider()
+		if err != nil {
+			return err
+		}
+		if req.Infra.MachineTemplate != nil {
+			capiInfraMachineTemplate, err := rawManifestFromObject(req.Infra.MachineTemplate)
+			if err != nil {
+				return newBadRequestErrorf("failed to convert infra.machineTemplate: %v", err)
+			}
+			capiProvider.InfraMachineTemplate = capiInfraMachineTemplate
+		}
+		if req.Infra.BootstrapFiles != nil {
+			capiProvider.BootstrapFiles = dbCloudInitFilesFromAPI(req.Infra.BootstrapFiles)
+		}
+		if req.Infra.PreKubeadmCommands != nil {
+			capiProvider.PreKubeadmCommands = append([]string(nil), req.Infra.PreKubeadmCommands...)
+		}
+		dbNodePool.SetCapi(capiProvider)
+
+	case db.ProviderTypeLaunchLayer:
+		// No-op: every LaunchLayer node-pool field is fixed at creation, so
+		// launchLayer has no updatable fields (see
+		// LaunchLayerNodePoolProviderUpdate in openapi.yaml) —
+		// req.LaunchLayer being non-nil just means the caller sent an empty
+		// launchLayer object, which changes nothing.
+	}
+
+	return nil
+}
+
+func validateUpdatedNodePool(cluster db.Cluster, dbNodePool *db.NodePool) error {
+	if dbNodePool.ControlPlane && dbNodePool.MaxSurge > 1 {
+		return newBadRequestErrorf("maxSurge should be max 1 for control plane nodepools")
+	}
+
+	switch cluster.ProviderType {
+	case db.ProviderTypeCAPI:
+		return validateUpdatedCAPINodePool(cluster, dbNodePool)
+	case db.ProviderTypeLaunchLayer:
+		return validateUpdatedLaunchLayerNodePool(cluster, dbNodePool)
+	case db.ProviderTypeNico:
+		return validateUpdatedForgeNodePool(cluster, dbNodePool)
+	default:
+		return newBadRequestErrorf("unsupported provider type %q for cluster %s", cluster.ProviderType, cluster.ID)
+	}
+}
+
+func validateUpdatedLaunchLayerNodePool(cluster db.Cluster, dbNodePool *db.NodePool) error {
+	validator, err := clients.GetNodePoolPayloadValidator(cluster)
+	if err != nil {
+		return err
+	}
+	if err := validator.ValidateNodePoolPayload(*dbNodePool); err != nil {
+		return newBadRequestErrorf("%s", err.Error())
+	}
+	return nil
+}
+
+func validateUpdatedCAPINodePool(cluster db.Cluster, dbNodePool *db.NodePool) error {
+	if dbNodePool.Nico != nil && dbNodePool.Nico.DiskSelectionStrategy != "" {
+		return newBadRequestErrorf("nico.diskSelectionStrategy is not supported")
+	}
+	capiNodePoolProvider, err := dbNodePool.CAPIProvider()
+	if err != nil || capi.IsEmptyManifest(capiNodePoolProvider.InfraMachineTemplate) {
+		return newBadRequestErrorf("infra.machineTemplate is required")
+	}
+	validator, err := clients.GetNodePoolPayloadValidator(cluster)
+	if err != nil {
+		return err
+	}
+	if err := validator.ValidateNodePoolPayload(*dbNodePool); err != nil {
+		return newBadRequestErrorf("invalid infra.machineTemplate: %s", err)
+	}
+	for _, file := range capiNodePoolProvider.BootstrapFiles {
+		switch file.Path {
+		case constants.CAPISpireAgentConfigPath, constants.CAPISpireTrustBundlePath:
+			return newBadRequestErrorf("file path %q is managed by the controller and must not be provided", file.Path)
+		}
+	}
+
+	return nil
+}
+
+func validateUpdatedForgeNodePool(_ db.Cluster, dbNodePool *db.NodePool) error {
+	var diskSelectionStrategy db.DiskSelectionStrategy
+	if dbNodePool.Nico != nil {
+		diskSelectionStrategy = dbNodePool.Nico.DiskSelectionStrategy
+	}
+	if err := nico.ValidateDiskSelectionStrategy(diskSelectionStrategy); err != nil {
+		return newBadRequestErrorf("%s", err.Error())
+	}
+	return nil
+}
+
+// validateUpdateNodePoolRequest validates cluster-type-specific update fields before the request is applied.
+func (s *nodePoolService) validateUpdateNodePoolRequest(cluster db.Cluster, req *api.UpdateNodePoolRequest) error {
+	switch cluster.ProviderType {
+	case db.ProviderTypeCAPI:
+		if req != nil && (req.Infra != nil || req.Nico != nil) {
+			if err := s.providers.require(config.InfraProviderInfra); err != nil {
+				return err
+			}
+		}
+		return validateUpdateCAPINodePoolRequest(cluster, req)
+	case db.ProviderTypeNico:
+		if req != nil && (req.Nico != nil || req.Infra != nil) {
+			if err := s.providers.require(config.InfraProviderNico); err != nil {
+				return err
+			}
+		}
+		return validateUpdateNicoNodePoolRequest(cluster, req)
+	case db.ProviderTypeLaunchLayer:
+		if req != nil && (req.LaunchLayer != nil || req.Nico != nil || req.Infra != nil) {
+			if err := s.providers.require(config.InfraProviderLaunchLayer); err != nil {
+				return err
+			}
+		}
+		return validateUpdateLaunchLayerNodePoolRequest(req)
+	default:
+		return fmt.Errorf("unsupported cluster provider")
+	}
+}
+
+func validateUpdateLaunchLayerNodePoolRequest(req *api.UpdateNodePoolRequest) error {
+	if req == nil {
+		return nil
+	}
+	if req.Nico != nil {
+		return fmt.Errorf("nico is not supported, please use launchLayer")
+	}
+	if req.Infra != nil {
+		return fmt.Errorf("infra is not supported, please use launchLayer")
+	}
+	return nil
+}
+
+func validateUpdateCAPINodePoolRequest(cluster db.Cluster, req *api.UpdateNodePoolRequest) error {
+	if req.Nico != nil {
+		return fmt.Errorf("nico is not supported, please use infra")
+	}
+	if req.LaunchLayer != nil {
+		return fmt.Errorf("launchLayer is not supported, please use infra")
+	}
+	if req.Infra != nil && req.Infra.MachineTemplate != nil {
+		if isEmptyManifestObject(req.Infra.MachineTemplate) {
+			return fmt.Errorf("infra.machineTemplate cannot be empty")
+		}
+		infraMachineTemplate, err := rawManifestFromObject(req.Infra.MachineTemplate)
+		if err != nil {
+			return fmt.Errorf("invalid infra.machineTemplate: %w", err)
+		}
+		var nodePool db.NodePool
+		nodePool.SetCapi(db.CAPINodePoolProvider{InfraMachineTemplate: infraMachineTemplate})
+		validator, err := clients.GetNodePoolPayloadValidator(cluster)
+		if err != nil {
+			return err
+		}
+		if err := validator.ValidateNodePoolPayload(nodePool); err != nil {
+			return fmt.Errorf("invalid infra.machineTemplate: %w", err)
+		}
+	}
+	if req.Infra != nil && req.Infra.BootstrapFiles != nil {
+		if err := validateCloudInitFiles(req.Infra.BootstrapFiles); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateUpdateNicoNodePoolRequest(_ db.Cluster, req *api.UpdateNodePoolRequest) error {
+	if req.Infra != nil {
+		return fmt.Errorf("infra is not supported, please use nico")
+	}
+	if req.LaunchLayer != nil {
+		return fmt.Errorf("launchLayer is not supported, please use nico")
+	}
+	// Disk selection strategy content-validity (and the subnet/VPC-prefix
+	// exclusivity checked below) is re-checked against the full merged
+	// payload by validateUpdatedForgeNodePool once this patch is applied —
+	// no need to duplicate it here against the partial request.
+	// The release can be replaced but not cleared. Rejecting the empty value
+	// here rather than after the merge leaves a pool whose stored profile is
+	// already empty patchable in every other respect. The config profile is
+	// optional and may be cleared.
+	if req.Nico != nil {
+		if req.Nico.Release != nil && *req.Nico.Release == "" {
+			return fmt.Errorf("nico.release cannot be cleared for a nico node pool")
+		}
+	}
+
+	if !nonEmptySubnetIDs(req) && !nonEmptyVpcPrefixIDs(req) {
+		return nil
+	}
+	if nonEmptySubnetIDs(req) && nonEmptyVpcPrefixIDs(req) {
+		return fmt.Errorf("cannot provide both nico.subnetIDs and nico.vpcPrefixIDs")
+	}
+
+	return nil
+}
+
+func nonEmptySubnetIDs(req *api.UpdateNodePoolRequest) bool {
+	return req != nil && req.Nico != nil && req.Nico.SubnetIDs != nil && len(req.Nico.SubnetIDs) > 0
+}
+
+func nonEmptyVpcPrefixIDs(req *api.UpdateNodePoolRequest) bool {
+	return req != nil && req.Nico != nil && req.Nico.VpcPrefixIDs != nil && len(req.Nico.VpcPrefixIDs) > 0
+}
+
+func dbNodeTaintsFromAPI(taints []api.NodeTaint) []db.NodeTaint {
+	out := make([]db.NodeTaint, 0, len(taints))
+	for _, taint := range taints {
+		out = append(out, db.NodeTaint{
+			Key:    taint.Key,
+			Value:  taint.Value,
+			Effect: string(taint.Effect),
+		})
+	}
+	return out
+}
+
+func apiNodeTaintsFromDB(taints []db.NodeTaint) []api.NodeTaint {
+	out := make([]api.NodeTaint, 0, len(taints))
+	for _, taint := range taints {
+		out = append(out, api.NodeTaint{
+			Key:    taint.Key,
+			Value:  taint.Value,
+			Effect: api.NodeTaintEffect(taint.Effect),
+		})
+	}
+	return out
+}
+
+// uuidSliceDedupe returns a copy of s with duplicate UUIDs removed (order preserved by first occurrence).
+func uuidSliceDedupe(s []uuid.UUID) []uuid.UUID {
+	seen := make(map[uuid.UUID]struct{})
+	out := make([]uuid.UUID, 0, len(s))
+	for _, id := range s {
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func apiNodePoolFromDB(dbNodePool *db.NodePool) api.NodePool {
+	var maxSurge *int
+	if dbNodePool.MaxSurge > 0 {
+		maxSurge = &dbNodePool.MaxSurge
+	}
+	var kubeReservedMemory *string
+	if dbNodePool.KubeReservedMemory != "" {
+		kubeReservedMemory = &dbNodePool.KubeReservedMemory
+	}
+	return api.NodePool{
+		ID:                          dbNodePool.ID,
+		ClusterID:                   dbNodePool.ClusterID,
+		Name:                        dbNodePool.Name,
+		NodeNamePrefix:              dbNodePool.NodeNamePrefix,
+		Description:                 dbNodePool.Description,
+		KubernetesVersion:           dbNodePool.KubernetesVersion,
+		SystemReservedMemory:        &dbNodePool.SystemReservedMemory,
+		KubeReservedMemory:          kubeReservedMemory,
+		ControlPlane:                dbNodePool.ControlPlane,
+		NodeLabels:                  maps.Clone(dbNodePool.NodeLabels),
+		NodeTaints:                  apiNodeTaintsFromDB(dbNodePool.NodeTaints),
+		DesiredNodeCount:            dbNodePool.DesiredCount,
+		AutoProvisionDisabled:       dbNodePool.AutoProvisionDisabled,
+		AutoModeDisabled:            dbNodePool.AutoModeDisabled,
+		ProvisioningMonitorDisabled: dbNodePool.ProvisioningMonitorDisabled,
+		RecycleBudget:               dbNodePool.RecycleBudget,
+		MaxSurge:                    maxSurge,
+		CurrentNodeSetID:            dbNodePool.CurrentNodeSetID,
+		TeleportEnabled:             &dbNodePool.TeleportEnabled,
+
+		Nico:        apiNicoNodePoolProviderFromDB(dbNodePool.Nico),
+		Infra:       apiInfraNodePoolProviderFromDB(dbNodePool.Capi),
+		LaunchLayer: apiLaunchLayerNodePoolProviderFromDB(dbNodePool.LaunchLayer),
+
+		Conditions: api.NodePoolConditions{
+			Provisioning: apiConditionFromDB(dbNodePool.Conditions.Provisioning),
+			Provisioned:  apiConditionFromDB(dbNodePool.Conditions.Provisioned),
+			Deleting:     apiConditionFromDB(dbNodePool.Conditions.Deleting),
+		},
+		MachineAnnotations: maps.Clone(dbNodePool.MachineAnnotations),
+		MachineLabels:      maps.Clone(dbNodePool.MachineLabels),
+	}
+}
+
+func apiNicoNodePoolProviderFromDB(nicoNodePoolProvider *db.NicoNodePoolProvider) *api.NicoNodePoolProvider {
+	if nicoNodePoolProvider == nil {
+		return nil
+	}
+	return &api.NicoNodePoolProvider{
+		SubnetIDs:                append([]uuid.UUID(nil), nicoNodePoolProvider.SubnetIDs...),
+		VpcPrefixIDs:             append([]uuid.UUID(nil), nicoNodePoolProvider.VpcPrefixIDs...),
+		InstanceTypeID:           nicoNodePoolProvider.InstanceTypeID,
+		InfinibandPartitionID:    clonePtr(nicoNodePoolProvider.InfinibandPartitionID),
+		NvLinkLogicalPartitionID: clonePtr(nicoNodePoolProvider.NvLinkLogicalPartitionID),
+		SSHKeyGroupIDs:           cloneUUIDSlicePtr(nicoNodePoolProvider.SSHKeyGroupIDs),
+		Release:                  nicoNodePoolProvider.Release,
+		ConfigProfile:            nicoNodePoolProvider.ConfigProfile,
+		DiskSelectionStrategy:    api.DiskSelectionStrategyCreate(nicoNodePoolProvider.DiskSelectionStrategy),
+	}
+}
+
+func apiInfraNodePoolProviderFromDB(capiNodePoolProvider *db.CAPINodePoolProvider) *api.InfraNodePoolProvider {
+	if capiNodePoolProvider == nil {
+		return nil
+	}
+	obj, err := objectFromRawManifest(capiNodePoolProvider.InfraMachineTemplate)
+	if err != nil {
+		obj = nil
+	}
+	out := &api.InfraNodePoolProvider{
+		MachineTemplate:    obj,
+		PreKubeadmCommands: append([]string(nil), capiNodePoolProvider.PreKubeadmCommands...),
+	}
+	if apiFiles := apiCloudInitFilesFromDB(capiNodePoolProvider.BootstrapFiles); apiFiles != nil {
+		out.BootstrapFiles = *apiFiles
+	}
+	return out
+}
+
+func apiLaunchLayerNodePoolProviderFromDB(provider *db.LaunchLayerNodePoolProvider) *api.LaunchLayerNodePoolProvider {
+	if provider == nil {
+		return nil
+	}
+	out := &api.LaunchLayerNodePoolProvider{
+		InstanceType:  provider.InstanceType,
+		HostOSProfile: provider.HostOSProfile,
+		VMProfile:     provider.VMProfile,
+	}
+	if provider.FulfillmentStrategy != "" {
+		strategy := api.LaunchLayerNodePoolProviderFulfillmentStrategy(provider.FulfillmentStrategy)
+		out.FulfillmentStrategy = &strategy
+	}
+	if len(provider.SecurityGroupRefs.PrimaryNetworkInterface) > 0 || len(provider.SecurityGroupRefs.GPUNetworkInterface) > 0 {
+		out.SecurityGroupRefs = &api.LaunchLayerSecurityGroupRefs{
+			PrimaryNetworkInterface: provider.SecurityGroupRefs.PrimaryNetworkInterface,
+			GpuNetworkInterface:     provider.SecurityGroupRefs.GPUNetworkInterface,
+		}
+	}
+	out.SecurityGroups = apiLaunchLayerSecurityGroupsFromDB(provider.SecurityGroups)
+	return out
+}
+
+func apiLaunchLayerSecurityGroupsFromDB(groups db.LaunchLayerSecurityGroups) *api.LaunchLayerSecurityGroups {
+	if len(groups.PrimaryNetworkInterface) == 0 && len(groups.GPUNetworkInterface) == 0 {
+		return nil
+	}
+	return &api.LaunchLayerSecurityGroups{
+		PrimaryNetworkInterface: groups.PrimaryNetworkInterface,
+		GpuNetworkInterface:     groups.GPUNetworkInterface,
+	}
+}
+
+// clonePtr copies the pointee so a normalized request never shares a scalar with
+// the caller's payload. A nil pointer stays nil: for an optional update field that
+// is the difference between "omitted" and "explicitly set", including set to empty.
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func cloneUUIDSlicePtr(s []uuid.UUID) *[]uuid.UUID {
+	if s == nil {
+		return nil
+	}
+	out := append([]uuid.UUID(nil), s...)
+	if out == nil {
+		out = []uuid.UUID{}
+	}
+	return &out
+}
+
+func dbNodePoolFromAPI(
+	req *api.CreateNodePoolRequest,
+	kubernetesVersion string,
+) (db.NodePool, error) {
+	nodeLabels := map[string]string{}
+	if req.NodeLabels != nil {
+		nodeLabels = req.NodeLabels
+	}
+	nodeTaints := []db.NodeTaint{}
+	if req.NodeTaints != nil {
+		nodeTaints = dbNodeTaintsFromAPI(req.NodeTaints)
+	}
+
+	nodePoolID := uuid.New()
+
+	autoProvisionDisabled := req.AutoProvisionDisabled != nil && *req.AutoProvisionDisabled
+	autoModeDisabled := req.AutoModeDisabled != nil && *req.AutoModeDisabled
+	provisioningMonitorDisabled := req.ProvisioningMonitorDisabled != nil && *req.ProvisioningMonitorDisabled
+	recycleBudget := 0
+	if req.RecycleBudget != nil {
+		recycleBudget = *req.RecycleBudget
+	}
+
+	var teleportEnabled bool
+	if req.TeleportEnabled != nil {
+		teleportEnabled = *req.TeleportEnabled
+	}
+
+	nodePool := db.NodePool{
+		ID:                   nodePoolID,
+		ClusterID:            req.ClusterID,
+		Name:                 req.Name,
+		NodeNamePrefix:       req.NodeNamePrefix,
+		Description:          req.Description,
+		KubernetesVersion:    kubernetesVersion,
+		SystemReservedMemory: req.SystemReservedMemory,
+		KubeReservedMemory:   req.KubeReservedMemory,
+		ControlPlane:         req.ControlPlane,
+		NodeLabels:           nodeLabels,
+		NodeTaints:           nodeTaints,
+		Conditions: db.NodePoolConditions{
+			Provisioning: db.NewCondition(true, "Starting provisioning"),
+			Provisioned:  db.NewCondition(false, "Not yet provisioned"),
+			Deleting:     db.NewCondition(false, "Node pool is not being deleted"),
+		},
+		DesiredCount:                req.DesiredNodeCount,
+		AutoProvisionDisabled:       autoProvisionDisabled,
+		AutoModeDisabled:            autoModeDisabled,
+		ProvisioningMonitorDisabled: provisioningMonitorDisabled,
+		RecycleBudget:               recycleBudget,
+		TeleportEnabled:             teleportEnabled,
+		MachineAnnotations:          db.CloneStringMap(req.MachineAnnotations),
+		MachineLabels:               db.CloneStringMap(req.MachineLabels),
+	}
+
+	switch {
+	case req.Nico != nil:
+		sshKeyGroupIDs := make([]uuid.UUID, 0)
+		if req.Nico.SSHKeyGroupIDs != nil {
+			sshKeyGroupIDs = append(sshKeyGroupIDs, *req.Nico.SSHKeyGroupIDs...)
+		}
+		subnetIDs := make([]uuid.UUID, 0)
+		if req.Nico.SubnetIDs != nil {
+			subnetIDs = append(subnetIDs, req.Nico.SubnetIDs...)
+		}
+		vpcPrefixIDs := make([]uuid.UUID, 0)
+		if req.Nico.VpcPrefixIDs != nil {
+			vpcPrefixIDs = append(vpcPrefixIDs, req.Nico.VpcPrefixIDs...)
+		}
+		nodePool.SetNico(db.NicoNodePoolProvider{
+			SubnetIDs:                subnetIDs,
+			VpcPrefixIDs:             vpcPrefixIDs,
+			InstanceTypeID:           req.Nico.InstanceTypeID,
+			InfinibandPartitionID:    req.Nico.InfinibandPartitionID,
+			NvLinkLogicalPartitionID: req.Nico.NvLinkLogicalPartitionID,
+			SSHKeyGroupIDs:           sshKeyGroupIDs,
+			Release:                  req.Nico.Release,
+			ConfigProfile:            req.Nico.ConfigProfile,
+			DiskSelectionStrategy:    db.DiskSelectionStrategy(req.Nico.DiskSelectionStrategy),
+		})
+	case req.Infra != nil:
+		infraMachineTemplate, err := rawManifestFromObject(req.Infra.MachineTemplate)
+		if err != nil {
+			return db.NodePool{}, err
+		}
+		nodePool.SetCapi(db.CAPINodePoolProvider{
+			InfraMachineTemplate: infraMachineTemplate,
+			BootstrapFiles:       dbCloudInitFilesFromAPI(req.Infra.BootstrapFiles),
+			PreKubeadmCommands:   append([]string(nil), req.Infra.PreKubeadmCommands...),
+		})
+	case req.LaunchLayer != nil:
+		nodePool.SetLaunchLayer(dbLaunchLayerNodePoolProviderFromAPI(*req.LaunchLayer))
+	}
+
+	return nodePool, nil
+}

@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# gitleaks configuration for the Secrets workflow (auto-detected at the repo
+# root). Extends the default ruleset.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """vendor/ is the committed Go workspace vendor tree: verbatim
+third-party dependency source, which carries its upstream test fixtures —
+sample private keys, dummy tokens and the like. They are published upstream
+already and are not credentials of this repository. First-party code is not
+covered by this allowlist."""
+paths = [
+  '''^vendor/.*''',
+]
+
+[[allowlists]]
+description = """server.gen.go embeds the OpenAPI document as base64 of its
+gzip, split across 80-character string literals. Every one of those lines is
+high-entropy base64, so generic-api-key matches them. Editing openapi.yaml
+recompresses the whole blob, which makes every line new in the diff, so this
+fires on any pull request that touches the spec. The content is openapi.yaml,
+which is scanned on its own; only this one generated file is exempt, not
+*.gen.go as a group."""
+paths = [
+  '''^controller/api/server\.gen\.go$''',
+]
+
+[[allowlists]]
+description = """environments/forge.yaml carried the RelEng Forge account's
+identifiers until they moved to repository variables. generic-api-key matches
+the SSH key group id on entropy -- it is a UUID, not a key, and a key group
+governs Serial-over-LAN console access rather than granting anything. The
+values are gone from the tree; the commits behind this branch are where they
+were. The repository squash-merges and deletes the branch, so none of that
+reaches main's history.
+
+Scoped by shape rather than by commit. Naming the two commits was tighter, but
+it could not survive a rebase: the workflow scans origin/main..HEAD, a rebase
+gives every commit on the branch a new sha, and the allowlist would then point
+at commits that do not exist -- turning the scan red for a reason unrelated to
+anything it found. Listing the values instead is not open to us either,
+because writing them here publishes the identifiers
+hack/internal-config-check.sh exists to keep out of the tree.
+
+So: a UUID, in that one file, and nothing else. That a UUID is not a
+credential is the argument above; a secret of any other shape in that file is
+still caught, as is anything at all in any other file. The tree is held to the
+stronger rule by internal-config-check, which fails the merge gate if a known
+identifier comes back."""
+condition = "AND"
+paths = [
+  '''^controller/test/e2e/environments/forge\.yaml$''',
+]
+regexes = [
+  '''[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}''',
+]
+
+[[allowlists]]
+description = """The redaction test needs strings that look exactly like the
+secrets redaction is supposed to remove, because what it asserts is that they
+are absent from the archive afterwards. A fixture that did not look like a
+credential would not exercise the thing under test. Both are plainly
+synthetic: the token is the nvapi- prefix followed by a counting sequence, and
+the password is the MD5 of "12345". Scoped to these two literals in this one
+file rather than to the file as a whole, so a real credential added beside
+them is still caught."""
+condition = "AND"
+paths = [
+  '''^controller/test/e2e/internal/site/redact_test\.go$''',
+]
+regexes = [
+  '''nvapi-0123456789abcdefghij''',
+  '''8f14e45fceea167a5a36dedd4bea2543''',
+]
+
+[[allowlists]]
+description = """The name-check test's CLEAN fixture is a line of words that
+contain the banned name without being it, and one of them is a go.sum-shaped
+module hash for nats-io/nkeys. generic-api-key reads "nkeys h1:<base64>" as a
+keyed secret. The hash is synthetic -- a short prefix padded with "abcdef" --
+and names no module version. Scoped to that one literal in that one file, so a
+real credential added beside it is still caught.
+
+It reaches a scan on any branch that merges main after #1444, because the
+workflow scans merges as their first-parent diff and that diff carries the
+file's addition."""
+condition = "AND"
+paths = [
+  '''^hack/test_name_check\.py$''',
+]
+regexes = [
+  '''9Q3nKEdv4abcdef''',
+]
+
+[[allowlists]]
+description = """env.go names the environment variables the bootstrap e2e
+lanes configure a run through. One of them is NVKECTL_E2E_ENCRYPTION_KEY_OUT,
+which names the file `nvkectl bootstrap site --encryption-key-out` writes the
+etcd encryption key to. generic-api-key matches the constant that holds it on
+entropy: the Go identifier EnvEncryptionKeyOut supplies the rule's keyword and
+the variable's name is a thirty-character upper-case string. What is matched is
+the name of an environment variable, not its value and not a key -- the key
+itself is written at run time to a path the lane chooses, and never enters the
+tree. The same string sits in run.sh and run-nico.sh without matching, because
+only the Go identifier puts "key" beside an assignment.
+
+Scoped to that one literal in that one file rather than to the file as a whole,
+so a real credential added beside it is still caught."""
+condition = "AND"
+paths = [
+  '''^cli/e2e/bootstrap/bootstraptest/env\.go$''',
+]
+regexes = [
+  '''NVKECTL_E2E_ENCRYPTION_KEY_OUT''',
+]
+
+[[allowlists]]
+description = """The qualify-e2e.sh tests' table rows name the stream they plan, and
+several set NGC_API_KEY or name capi-provisioned in the row before it.
+generic-api-key takes either as the keyword and the stream id
+forge-l40s-amd64 that follows as the secret. It is a stream from the
+qualification matrix, not a credential.
+
+Scoped to that one literal in that one file rather than to the file as a whole,
+so a real credential added beside it is still caught."""
+condition = "AND"
+paths = [
+  '''^release/internal/qualification/script_test\.go$''',
+]
+regexes = [
+  '''forge-l40s-amd64''',
+]

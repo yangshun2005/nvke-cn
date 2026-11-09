@@ -1,0 +1,425 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Image
+
+# Self-hosted runners do not pick up jobs from pull_request events, so pull
+# requests are tested through the pull-request/<number> branch instead.
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+  workflow_dispatch:
+
+permissions: {}
+
+# Defined once so the scan and the summary below cannot disagree about what the
+# gate is. The old summary heading said "medium and above" and would have gone
+# stale the moment the cutoff changed.
+env:
+  GRYPE_SEVERITY_CUTOFF: critical
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started. Five merges in
+  # three minutes cancelled 18 runs across 7 workflows this way, leaving
+  # three consecutive commits on main with no test result at all.
+  #
+  # Pull-request branches keep sharing a group and still cancel, which is
+  # what you want there.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so any workflow merge-gate.yml calls would
+  # share a group with its siblings and cancel them. 8 of 9 calls died that way,
+  # reported as failures with no jobs and no error message.
+  group: Image-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  # Do not cancel a run on main: back-to-back merges would otherwise
+  # discard this check's result for the intermediate commit, leaving a
+  # commit on main that nothing ever verified. Same guard as the other
+  # workflows here.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  image:
+    name: build
+    runs-on: linux-amd64-cpu16
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read           # upload-sarif reads the workflow run
+      security-events: write  # the image scan uploads to code scanning
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The docker-container driver runs BuildKit in its own container, so it
+      # does not inherit the daemon's registry-mirror configuration. NVIDIA
+      # runners ship a prepopulated buildkitd.toml pointing at the local mirror;
+      # use it when present so base-image pulls are cached and not subject to
+      # Docker Hub rate limits. Absent, buildx is set up exactly as before.
+      - name: Detect runner BuildKit config
+        id: buildkit
+        shell: bash
+        run: |
+          if [[ -r /etc/buildkit/buildkitd.toml ]]; then
+            echo "config=/etc/buildkit/buildkitd.toml" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config: ${{ steps.buildkit.outputs.config }}
+
+      # Enable arm64 cross-compilation on the amd64 runner via QEMU so
+      # BuildKit can produce a genuine linux/arm64 layer.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      # Validates every Dockerfile parses and every FROM resolves against the
+      # default BASE_REGISTRY. This is what catches a base image that external
+      # contributors cannot pull.
+      - name: Check Dockerfiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          # $1 is the Dockerfile, $2 the context. Anything after that is passed
+          # to docker, which is how a Dockerfile whose default base is built
+          # locally gets a resolvable one for the parse.
+          check() {
+            echo "::group::docker build --check $1"
+            docker build --check "${@:3}" -f "$1" "$2" || status=1
+            echo "::endgroup::"
+          }
+          # The controller Dockerfile builds from the repository root: the
+          # module lives in the root Go workspace and needs go.work.
+          check controller/Dockerfile                    .
+          check controller/test/e2e/Dockerfile           .
+          check cluster-api-provider-provisioned/Dockerfile .
+          check controller/hack/capd-reboot-controller/Dockerfile controller/hack/capd-reboot-controller
+          check agent/Dockerfile.nke-builder             agent
+
+          # These three are checked but never built: capd-kindest-node and
+          # controller.tilt need inputs CI does not have, and Dockerfile.proto is
+          # developer tooling.
+          check controller/hack/capd-kindest-node/Dockerfile      controller/hack/capd-kindest-node
+          check agent/internal-scripts/docker/Dockerfile.proto    agent/internal-scripts/docker
+
+          # The nvkectl bootstrap substrate node. Its default base,
+          # cwe-capd-kindest-node:local, is built by the e2e lane and is not
+          # pullable, so --check cannot resolve it and the file went unchecked.
+          # Any resolvable node image parses it, and kindest/node is the image
+          # capd-kindest-node derives that local one from in the first place.
+          check cli/e2e/bootstrap/substrate/node/Dockerfile       cli/e2e/bootstrap/substrate/node \
+                --build-arg BASE_IMAGE=kindest/node:v1.36.4
+          # Tiltfile builds controller.tilt from a temporary directory holding bin/,
+          # profiles/ and ui/, so its real context does not exist in the tree.
+          # Using controller/ instead fails on CopyIgnoredFile, because
+          # controller/.dockerignore excludes **/bin.
+          check controller/hack/Dockerfile.controller.tilt        controller/hack
+
+          # The profiles fixture is the one non-shipped image whose context IS
+          # in the tree, so it is built for real below rather than only parsed.
+          exit $status
+
+      # Built rather than only checked, unlike the four above, because its whole
+      # context is in the tree. It ships nowhere: it is a test fixture the
+      # Tiltfile and capd-e2e use, and the fleet profiles image is built from
+      # nke-site-deploy. This is a compile check, not a publish step.
+      #
+      # A real build rather than `docker build --check`, because --check parses
+      # the Dockerfile and never resolves a COPY source. It would not notice
+      # profiles/ going missing, which is the failure worth catching here.
+      - name: Build the profiles fixture image
+        run: |
+          docker buildx build -f controller/test/fixtures/Dockerfile \
+            --platform linux/amd64 --load --progress=plain \
+            --tag cwe-profiles-fixture:ci \
+            controller/test/fixtures
+
+      # A real end-to-end image build. capd-reboot-controller is used because it
+      # has no private module dependencies, so it builds from public sources
+      # alone — which is exactly the property this check exists to protect.
+      - name: Build capd-reboot-controller image
+        shell: bash
+        run: |
+          docker buildx build \
+            --file controller/hack/capd-reboot-controller/Dockerfile \
+            --tag nvke/capd-reboot-controller:ci \
+            --load \
+            controller/hack/capd-reboot-controller
+
+      - name: Show image
+        shell: bash
+        run: docker image inspect nvke/capd-reboot-controller:ci --format 'built {{.RepoTags}} {{.Size}} bytes'
+
+      # A real end-to-end controller image build: it compiles the controller
+      # inside the build, resolving public Go modules without credentials. The context is the
+      # repository root because the controller is a workspace member (it needs
+      # go.work and the sibling modules). Verification only — the
+      # local tag is never pushed.
+      - name: Build controller image (amd64 and arm64)
+        shell: bash
+        run: |
+          docker buildx build \
+            --file controller/Dockerfile \
+            --platform linux/amd64,linux/arm64 \
+            --tag nke/nke-controller:ci \
+            .
+
+      # --load does not support multi-platform images. Load the amd64 image
+      # into the local daemon separately so subsequent steps can inspect and
+      # scan it. BuildKit reuses the layers already built above.
+      - name: Load controller image (amd64) for scan
+        shell: bash
+        run: |
+          docker buildx build \
+            --file controller/Dockerfile \
+            --platform linux/amd64 \
+            --tag nke/nke-controller:ci \
+            --load \
+            .
+
+      - name: Show controller image
+        shell: bash
+        run: docker image inspect nke/nke-controller:ci --format 'built {{.RepoTags}} {{.Size}} bytes'
+
+      # Scan the image, not the source tree. security-scan.yml runs Grype over
+      # `path: "."`, which reads Go dependencies from the repository. It cannot
+      # see what is in the image: the Alpine base, its OS packages, or the
+      # SPIFFE binary copied in from an external image. Those are what a
+      # consumer actually runs.
+      #
+      # Scanned here rather than in security-scan.yml because the image already
+      # exists at this point, loaded into the local daemon. Doing it there would
+      # mean building it a second time.
+      #
+      # Gates at critical. Everything from medium up still reaches the Security
+      # tab through the SARIF upload below; the cutoff decides what fails the
+      # build. .grype.yaml carries the known findings this does not fail on,
+      # each scoped to one package version and dated for review.
+      - name: Scan the controller image
+        id: image-scan
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: nke/nke-controller:ci
+          severity-cutoff: ${{ env.GRYPE_SEVERITY_CUTOFF }}
+          output-format: sarif
+          config: .grype.yaml
+          fail-build: true
+
+      # Renders the findings into the job summary rather than a count and a
+      # pointer elsewhere. When the scan gates, the step above prints one ERROR
+      # line and no list, so without this the only way to learn WHICH
+      # vulnerability failed the build is to leave the run for the Security tab.
+      - name: Summarise the image scan
+        if: always()
+        shell: bash
+        env:
+          CUTOFF: ${{ env.GRYPE_SEVERITY_CUTOFF }}
+        run: |
+          set -uo pipefail
+          f="${{ steps.image-scan.outputs.sarif }}"
+
+          if [ ! -s "${f}" ]; then
+            {
+              echo "## Grype — controller image"
+              echo
+              echo "No SARIF produced. The scan did not finish."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          {
+            echo "## Grype — controller image"
+            echo
+
+            # GitHub's SARIF convention puts a numeric CVSS in
+            # properties["security-severity"]; >=9 critical, >=7 high, >=4 medium.
+            echo "**Total reported:** $(jq '[.runs[].results[]] | length' "${f}")"
+            echo
+            echo "| Severity | Count |"
+            echo "|---|---|"
+            jq -r '
+              [ .runs[] as $r | $r.results[] as $res
+                | ($r.tool.driver.rules[] | select(.id==$res.ruleId)) as $rule
+                | (($rule.properties["security-severity"] // "0") | tonumber) as $s
+                | if $s>=9 then "critical" elif $s>=7 then "high"
+                  elif $s>=4 then "medium" else "low" end ]
+              | group_by(.) | sort_by(-(.[0]|
+                  if .=="critical" then 4 elif .=="high" then 3
+                  elif .=="medium" then 2 else 1 end))
+              | map("| \(.[0]) | \(length) |") | .[]' "${f}"
+            echo
+
+            echo "### Findings at or above the \`${CUTOFF}\` gate"
+            echo
+            jq -r --arg cutoff "${CUTOFF}" '
+              ($cutoff | if .=="critical" then 9 elif .=="high" then 7
+                         elif .=="medium" then 4 else 0 end) as $min
+              | [ .runs[] as $r | $r.results[] as $res
+                  | ($r.tool.driver.rules[] | select(.id==$res.ruleId)) as $rule
+                  | (($rule.properties["security-severity"] // "0") | tonumber) as $sev
+                  | select($sev >= $min)
+                  | { pkg:   (($rule.help.text // "") | capture("Package: (?<v>.*)").v // "?"),
+                      ver:   (($rule.help.text // "") | capture("Version: (?<v>.*)").v // "?"),
+                      fix:   (($rule.help.text // "") | capture("Fix Version: (?<v>.*)").v // "none"),
+                      id:    $res.ruleId,
+                      where: ($res.locations[0].physicalLocation.artifactLocation.uri // "?") } ]
+              | unique
+              | if length == 0 then "None — the gate passed."
+                else (["| Package | Version | Fixed in | ID | Where |","|---|---|---|---|---|"]
+                      + map("| \(.pkg) | \(.ver) | \(.fix) | \(.id) | `\(.where)` |")
+                      | join("\n"))
+                end' "${f}"
+            echo
+            echo "Full set in **Security -> Code scanning**, category \`grype-image\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload the image scan SARIF
+        if: always() && steps.image-scan.outputs.sarif != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ steps.image-scan.outputs.sarif }}
+          category: grype-image
+
+      # The scan above honours .grype.yaml but never says whether the entries in
+      # it still match anything. An entry whose upstream has shipped a fix
+      # suppresses nothing, and a no-op entry is what hides the next real
+      # finding: it stays in the file, nobody is forced to look at it, and the
+      # day the same package gets a new advisory it is already excused.
+      #
+      # Only entries declaring `scope=image` or `scope=both` are judged here.
+      # The source-tree scan in security-scan.yml judges the rest; neither scan
+      # sees the other's packages, so neither can call the other's entries dead.
+      #
+      # Skipped entirely while the list is empty, which is the normal state, so
+      # this costs a second scan only once there is something to check.
+      - name: Count the ignore entries
+        id: ignore
+        if: always()
+        run: echo "count=$(./hack/grype-ignore-check.sh --count)" >> "${GITHUB_OUTPUT}"
+
+      # A second pass, in JSON, because the SARIF above omits suppressed matches
+      # entirely -- they are exactly what this needs to read. No cutoff and no
+      # only-fixed filter: an entry covering an advisory with no fix available
+      # is still an entry that has to be matching something.
+      - name: Re-scan the image for suppressed findings
+        id: suppressed
+        if: always() && steps.ignore.outputs.count != '0'
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: nke/nke-controller:ci
+          severity-cutoff: negligible
+          output-format: json
+          only-fixed: false
+          config: .grype.yaml
+          fail-build: false
+
+      - name: Check every image-scoped exception still suppresses a finding
+        if: always() && steps.ignore.outputs.count != '0'
+        run: ./hack/grype-ignore-check.sh --applied image "${{ steps.suppressed.outputs.json }}"
+
+  # The site validation image, built the way image-validate-nvcr.yml publishes
+  # it but not pushed. Its own job, so it neither waits on nor adds to the
+  # controller build above. A real build because its context is an allowlist
+  # (controller/test/e2e/Dockerfile.dockerignore): a file the suite embeds that
+  # the list misses fails only when the image is built.
+  validate-image:
+    name: build validation image
+    runs-on: linux-amd64-cpu16
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect runner BuildKit config
+        id: buildkit
+        shell: bash
+        run: |
+          if [[ -r /etc/buildkit/buildkitd.toml ]]; then
+            echo "config=/etc/buildkit/buildkitd.toml" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config: ${{ steps.buildkit.outputs.config }}
+
+      # No QEMU: the binary is cross-compiled and the final stage runs nothing.
+      #
+      # Built twice, the second time with no cache and every file's mtime
+      # changed, as a fresh checkout elsewhere would have it. The two index
+      # digests must match: that is what lets a site build this itself and
+      # check the result against the digest the release attested.
+      - name: Build validation image (amd64 and arm64), twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C controller/test/e2e validate-image-oci \
+            VALIDATE_DIGEST_FILE="${RUNNER_TEMP}/first.txt" \
+            VALIDATE_OCI="${RUNNER_TEMP}/first.oci.tar"
+          find . -path ./.git -prune -o -type f -exec touch -d '2000-01-01T00:00:00Z' {} +
+          make -C controller/test/e2e validate-image-oci \
+            VALIDATE_BUILDX_ARGS=--no-cache \
+            VALIDATE_DIGEST_FILE="${RUNNER_TEMP}/second.txt" \
+            VALIDATE_OCI="${RUNNER_TEMP}/second.oci.tar"
+          first="$(cat "${RUNNER_TEMP}/first.txt")"
+          second="$(cat "${RUNNER_TEMP}/second.txt")"
+          echo "first ${first}, second ${second}"
+          [[ "${first}" == "${second}" ]] \
+            || { echo "::error::the validation image did not rebuild to the same digest"; exit 1; }
+
+      # Selection and report paths are what a test runner depends on, so they are
+      # checked in the built image rather than assumed from the Dockerfile.
+      - name: Dry-run the entrypoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file controller/test/e2e/Dockerfile \
+            --platform linux/amd64 --load \
+            --tag nvke/nvke-validate:ci \
+            .
+          mkdir -p "${RUNNER_TEMP}/artifacts"
+          chmod 0777 "${RUNNER_TEMP}/artifacts"
+          docker run --rm -v "${RUNNER_TEMP}/artifacts:/artifacts" \
+            nvke/nvke-validate:ci -ginkgo.dry-run
+          test -s "${RUNNER_TEMP}/artifacts/junit-test-report.xml"
+          test -s "${RUNNER_TEMP}/artifacts/report.json"
+          # Matched in a testcase's name, which carries its group, so text
+          # elsewhere in the report, such as the suite's properties, cannot
+          # stand in for a selected spec.
+          for group in 'controller management-plane health' 'site validation'; do
+            grep -q "<testcase name=\"[^\"]*${group}" "${RUNNER_TEMP}/artifacts/junit-test-report.xml" \
+              || { echo "::error::the JUnit report selected no '${group}' spec"; exit 1; }
+          done
+          ! grep -q '<testcase name="[^"]*tenant validation' "${RUNNER_TEMP}/artifacts/junit-test-report.xml" \
+            || { echo "::error::the image's default run selected tenant specs"; exit 1; }
+
+          # The tenant switch adds the tenant specs.
+          mkdir -p "${RUNNER_TEMP}/tenant-artifacts"
+          chmod 0777 "${RUNNER_TEMP}/tenant-artifacts"
+          docker run --rm -e NVKE_TENANT_VALIDATE=true -v "${RUNNER_TEMP}/tenant-artifacts:/artifacts" \
+            nvke/nvke-validate:ci -ginkgo.dry-run
+          grep -q '<testcase name="[^"]*tenant validation' "${RUNNER_TEMP}/tenant-artifacts/junit-test-report.xml" \
+            || { echo "::error::NVKE_TENANT_VALIDATE=true selected no tenant spec"; exit 1; }
+
+# Not built here: controller/hack/Dockerfile.controller.tilt — it only copies a
+# prebuilt binary, so it has nothing to verify without a preceding build.
+#
+# Nothing is pushed here. Publishing to nvcr.io lives in the per-component
+# workflows: image-nvcr.yml for the controller, image-provisioned-nvcr.yml for
+# cluster-api-provider-provisioned, image-validate-nvcr.yml for the validation
+# image.

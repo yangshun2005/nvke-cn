@@ -1,0 +1,95 @@
+{{- if .Values.capi.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "controller.fullname" . }}-capi
+  labels:
+    {{- include "controller.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - cluster.x-k8s.io
+    resources:
+      - machines
+      - clusters
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - cluster.x-k8s.io
+    resources:
+      - machines/status
+    verbs:
+      - patch
+  # The tenant-access controller owns each tenant's kubeconfig Secret by the
+  # CAPI Cluster, and OwnerReferencesPermissionEnforcement requires `update` on
+  # the owner's finalizers subresource before it will accept an ownerReference
+  # carrying blockOwnerDeletion.
+  #
+  # Without this the Secret is never created, Cluster API cannot probe the
+  # workload cluster, ControlPlaneInitialized stays False waiting for
+  # status.nodeRef, and every tenant cluster hangs in Provisioning indefinitely.
+  # The API error names blockOwnerDeletion and never the missing permission,
+  # which is what makes it hard to place.
+  #
+  # Its own rule rather than an entry in the list above: `update` is the only
+  # verb the enforcement checks, and create/delete on a subresource mean
+  # nothing.
+  - apiGroups:
+      - cluster.x-k8s.io
+    resources:
+      - clusters/finalizers
+    verbs:
+      - update
+  - apiGroups:
+      - infrastructure.cluster.x-k8s.io
+    resources:
+      - provisionedclusters
+      - provisionedmachines
+      - provisionedmachinetemplates
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - bootstrap.cluster.x-k8s.io
+    resources:
+      - kubeadmconfigs
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    resourceNames:
+      - provisionedclusters.infrastructure.cluster.x-k8s.io
+      - provisionedmachines.infrastructure.cluster.x-k8s.io
+      - provisionedmachinetemplates.infrastructure.cluster.x-k8s.io
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "controller.fullname" . }}-capi
+  labels:
+    {{- include "controller.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "controller.fullname" . }}-capi
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "controller.serviceAccountName" . }}
+    namespace: {{ include "controller.namespace" . }}
+{{- end }}

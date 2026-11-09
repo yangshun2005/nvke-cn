@@ -1,0 +1,65 @@
+# Build context exclusions for image builds rooted at the repository.
+#
+# Docker reads .dockerignore from the context root only. controller/Dockerfile
+# builds with the repository root as its context, so controller/.dockerignore
+# does not apply to it and this file is what governs that build.
+#
+# Keep this conservative. `COPY . /workspace` feeds a Go workspace build, so
+# every module directory, go.work, go.work.sum and the committed vendor/ tree
+# must reach the builder. LICENSE and NOTICE are copied into the final image.
+# Exclude only what the build cannot use.
+
+# Version control.
+.git
+.gitignore
+.gitattributes
+
+# Build output. Stale binaries from a host build would be copied in and, worse,
+# invalidate the layer cache on every local rebuild.
+bin/
+**/bin/
+release/
+**/release/
+# The root release/ is the release tooling module. go.work lists it, so any
+# image built from the workspace needs it. A nested release/ stays excluded.
+!release
+out/
+**/out/
+agent/build/deb/
+agent/build/deb_amd64/
+agent/build/deb_arm64/
+
+# Local test state and reports. E2E diagnostics may contain short-lived
+# bootstrap credentials and must never enter an image layer or BuildKit cache.
+.local/
+**/.local/
+# nico-sim VM overlays and seed ISOs can contain cloud-init credentials or
+# are host-local output; never part of controller builds.
+controller/nico-sim/.dev/
+controller/nico-sim/var/
+.flox/run/
+*.kubeconfig
+**/*.kubeconfig
+coverage.txt
+**/coverage.txt
+cobertura.xml
+**/cobertura.xml
+
+# Editor and OS files.
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local developer configuration. controller/README.md tells contributors to
+# create .env.local; it holds host-local settings and must never enter an image.
+.env
+.env.*
+**/.env
+**/.env.*
+
+# CI definitions and documentation. Neither is read by any image build.
+.github/
+docs/

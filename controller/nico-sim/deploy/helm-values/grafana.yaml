@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Grafana -- pre-configured with Loki datasource for dev convenience.
+adminPassword: admin
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Loki
+        type: loki
+        url: http://loki.observability.svc.cluster.local:3100
+        access: proxy
+        isDefault: true
+
+# Allow anonymous access for local development.
+grafana.ini:
+  auth.anonymous:
+    enabled: true
+    org_role: Admin
+  server:
+    root_url: http://localhost:3000

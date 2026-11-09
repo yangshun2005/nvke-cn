@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# OpenSSF Scorecard. The SARIF goes to Security -> Code scanning; the JSON
+# result is kept as a workflow artifact for the NVIDIA OSS scorecard tool.
+#
+# Scorecard grades supply-chain practice from outside: branch protection,
+# pinned dependencies, token permissions, signed releases, whether a fuzzer or
+# an SAST tool runs, how quickly dependencies are updated. It reads the
+# repository and its GitHub settings, so it reports on things no other check
+# here can see -- several of the findings are about repository configuration
+# rather than about code.
+#
+# It reports, it does not gate. Nothing here fails a build. The value is a
+# tracked list that changes when someone weakens a setting, which is the case
+# that goes unnoticed today.
+#
+# This is the second half of the supply-chain pair. dependency-review.yml
+# guards what a single pull request adds; this grades the repository as a
+# whole, on a schedule.
+#
+# Runs on a schedule and on push to main, NOT on pull_request. Scorecard needs
+# repository-level metadata and a token with more than a pull request should
+# ever carry, and its own documentation says to run it this way.
+#
+# publish_results stays off. Publishing lists the score on the OpenSSF API and
+# needs id-token: write; the JSON artifact below gives the NVIDIA OSS scorecard
+# tool the same document meanwhile.
+
+name: Scorecard
+
+on:
+  branch_protection_rule:
+  schedule:
+    # Weekly, an hour after the CodeQL sweep so the two do not contend.
+    - cron: '0 7 * * 1'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so any workflow merge-gate.yml calls would
+  # share a group with its siblings and cancel them. 8 of 9 calls died that way,
+  # reported as failures with no jobs and no error message.
+  group: Scorecard-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 30
+    permissions:
+      # Upload the findings to the code-scanning dashboard.
+      security-events: write
+      # Read the workflow run history, which several checks grade.
+      actions: read
+      contents: read
+      # Commit, review and check-run queries, the action's documented set.
+      issues: read
+      pull-requests: read
+      checks: read
+      # Commit statuses, which the CI-Tests check lists.
+      statuses: read
+      # No id-token: that is for publish_results, which is off below.
+      #
+      # Branch-Protection will score low or unknown as a result. It needs a PAT
+      # with admin read, which GITHUB_TOKEN cannot stand in for. Every other
+      # check works on the default token, so the rest of the report is real --
+      # read a weak Branch-Protection line as "not measured", not as a finding.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: false
+
+      # The SARIF keeps a check only when it scores below the action's policy,
+      # and drops inconclusive checks, so per-check scores do not survive it.
+      # The JSON result is the document the OpenSSF API serves.
+      - name: Write the JSON result
+        uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.json
+          results_format: json
+          publish_results: false
+
+      # The SARIF file, kept for 5 days. The dashboard shows current findings
+      # only, so this is what lets you compare a run against an earlier one
+      # while working through them.
+      - name: Upload the SARIF as an artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scorecard-results
+          path: results.sarif
+          retention-days: 5
+
+      # Read by the NVIDIA OSS scorecard tool (OPENSSF_SCORECARD_ARTIFACT) when
+      # the OpenSSF API has no record of this repository.
+      - name: Upload the JSON result as an artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openssf-scorecard-json
+          path: results.json
+          retention-days: 90
+
+      - name: Upload the SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: results.sarif

@@ -1,0 +1,216 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Verifies that committed generated output matches its source definitions.
+#
+# controller/Makefile has had a `generate-check` target for exactly this, and
+# nothing ever called it: no workflow referenced generate-check, go generate or
+# oapi-codegen. That left 10,000+ lines of generated client and server code
+# free to drift from the API contract they are generated from.
+#
+# The drift is not hypothetical and not greppable. api/server.gen.go embeds the
+# OpenAPI spec as gzip+base64, so a stale copy sits inside a compressed blob
+# where no code search can see it -- which is how one survived a re-snapshot
+# until it was found by decoding the blob.
+#
+# This is the third generated-artefact gate, alongside notices-check.yml and
+# go-work-check.yml.
+
+name: Generate Check
+
+# All pull requests, including forks and Dependabot, reach this through
+# merge-gate.yml. The standalone push trigger is post-merge coverage on main;
+# naming mirror or Dependabot branches here too would run it a second time.
+on:
+  push:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  # The sha is part of the group on main, so every commit gets its own.
+  # Without it, back-to-back merges lose CI results: GitHub allows one
+  # running and one pending run per group, and cancels the pending one
+  # when a third arrives -- whatever cancel-in-progress says, because that
+  # setting only protects a run that has already started. Five merges in
+  # three minutes cancelled 18 runs across 7 workflows this way, leaving
+  # three consecutive commits on main with no test result at all.
+  #
+  # Pull-request branches keep sharing a group and still cancel, which is
+  # what you want there.
+  # A literal name, NOT ${{ github.workflow }}. Inside a called workflow that
+  # expression is the CALLER's name, so every workflow merge-gate.yml calls would
+  # compute the same group and cancel each other -- 8 of 9 calls died that way,
+  # reported to the gate as failures with no jobs and no error message.
+  group: Generate Check-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  generate-check:
+    name: Check generated API code is up to date
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    # GOWORK=off is required, not incidental. The generator is pinned in its
+    # own module file (api/oapi-codegen.mod) because it needs an older
+    # kin-openapi than the api module does, and Go refuses -modfile in
+    # workspace mode: "go: -modfile cannot be used in workspace mode". The
+    # module resolves from public dependencies alone, so dropping the workspace
+    # costs nothing here.
+    env:
+      GOWORK: "off"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: controller/api/go.mod
+          cache: true
+          cache-dependency-path: |
+            controller/api/go.sum
+            controller/api/oapi-codegen.sum
+
+      # generate-check depends on generate-api, not on the full generate
+      # target. The difference matters here: `go generate ./...` across the
+      # whole controller module has to load a much larger package graph. The
+      # api module is self-contained, and it holds every
+      # //go:generate directive in the controller, so it is both the half that
+      # can run here and the half this check is about.
+      #
+      # It also fixes the Go version: controller/go.mod asks for a newer
+      # toolchain than controller/api/go.mod, and setup-go pins
+      # GOTOOLCHAIN=local, so loading the outer module under the api module's
+      # Go fails with "go.mod requires go >= 1.26.4".
+      - name: Verify generated API code is up to date
+        working-directory: controller
+        run: make generate-check
+
+  provisioned-generate-check:
+    name: Check generated provisioned provider code, CRDs, RBAC, and embedded manifest
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            cluster-api-provider-provisioned/go.sum
+
+      - name: Verify generated provider code, CRDs, and RBAC are up to date
+        run: make -C cluster-api-provider-provisioned generate-check
+
+      # nvkectl embeds this kustomize base rendered, so the render is checked
+      # here rather than in a job of its own: the inputs are the CRDs and RBAC
+      # the step above just verified, and a change to either stales it.
+      - name: Read pinned tool versions
+        id: versions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for var in KIND_VERSION KUBECTL_VERSION; do
+            value="$(make --no-print-directory "print-${var}")"
+            if [ -z "${value}" ]; then
+              echo "::error::make print-${var} returned nothing; make/versions.mk is broken"
+              exit 1
+            fi
+            echo "$(echo "${var}" | tr '[:upper:]' '[:lower:]')=${value}" >> "$GITHUB_OUTPUT"
+          done
+
+      # The renderer has to be the pinned one: the check compares bytes.
+      - name: Set up kubectl
+        uses: ./.github/actions/setup-kind
+        with:
+          kind_version: ${{ steps.versions.outputs.kind_version }}
+          kubectl_version: ${{ steps.versions.outputs.kubectl_version }}
+
+      - name: Verify the embedded provisioned provider manifest is up to date
+        run: make -C cli provider-manifest-check
+
+      # The controller chart installs its release CRDs from one rendered file,
+      # built from the management-engine CRDs with the same pinned kubectl, so it
+      # is checked here beside the other rendered bundle.
+      - name: Verify the controller chart's release CRDs are up to date
+        run: make chart-crds-check
+
+  # The third generated artifact. buf downloads its two remote plugins, both
+  # version-pinned in agent/buf.gen.yaml, so this needs the network the other
+  # two jobs do not.
+  proto-generate-check:
+    name: Check generated proto code is up to date
+    runs-on: ubuntu-latest
+    if: github.repository_id == '1323115536'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            agent/go.sum
+
+      - name: Verify proto formatting and generated code are up to date
+        run: make -C agent check-protos
+
+  # The CLI reference under cli/docs/reference, generated from the nvkectl cobra
+  # command tree. It belongs here rather than in docs-check.yml: that workflow
+  # checks prose against the repository, while this one checks committed
+  # generated output against its source, which is what the reference is.
+  #
+  # No credential, kubeconfig, configured site or cluster: hack/gendocs builds
+  # the command tree and reads its metadata without running a command. The
+  # module download is the only network it needs.
+  cli-docs-check:
+    name: Check the generated nvkectl CLI reference is up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache: true
+          cache-dependency-path: |
+            go.work.sum
+            cli/go.sum
+
+      # Deliberately not given the NVKECTL_ variables a bootstrap job would set.
+      # The generator clears them anyway -- two of `bootstrap site`'s flag
+      # defaults are read from the environment when the command is constructed
+      # -- but a job that sets them would hide a regression in that clearing.
+      - name: Verify the nvkectl command reference is up to date
+        run: make -C cli docs-check
