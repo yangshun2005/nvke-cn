@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Share dependencies and source across the manager and REST builds.
-FROM golang:1.27.3@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b AS builder
+FROM golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d AS builder
 ENV GOPROXY=https://proxy.golang.org|direct
 ARG VERSION=dev
 ARG TARGETOS
@@ -31,7 +31,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build CGO_ENABLED=0 GOOS=${TARGETO
 
 # Each runtime image contains only its service binary.
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329 AS runtime
+FROM gcr.io/distroless/static:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931 AS runtime
 WORKDIR /
 USER 65532:65532
 
