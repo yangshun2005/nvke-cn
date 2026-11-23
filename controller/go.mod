@@ -5,29 +5,29 @@ go 1.27.3
 require (
 	github.com/GehirnInc/crypt v0.0.0-20230320061759-8cc1b52080c5
 	github.com/blang/semver/v4 v4.0.0
-	github.com/caarlos0/env/v11 v11.4.1
-	github.com/dsx-ai-factory/cluster-api-provider-nico v0.1.0
+	github.com/caarlos0/env/v11 v11.4.2
+	github.com/dsx-ai-factory/cluster-api-provider-nico v0.2.0
 	github.com/dsx-ai-factory/nvke/agent v0.0.0-00010101000000-000000000000
 	github.com/dsx-ai-factory/nvke/auth v0.0.0-00010101000000-000000000000
 	github.com/dsx-ai-factory/nvke/controller/api v0.0.0-00010101000000-000000000000
 	github.com/dsx-ai-factory/nvke/management-engine v0.0.0-00010101000000-000000000000
 	github.com/evanphx/json-patch/v5 v5.9.11
-	github.com/getkin/kin-openapi v0.152.0
-	github.com/go-jose/go-jose/v4 v4.1.7
+	github.com/getkin/kin-openapi v0.153.0
+	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/go-logr/logr v1.4.4
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/cel-go v0.29.2
 	github.com/google/uuid v1.6.0
 	github.com/gravitational/teleport/api v0.0.0-20251224210154-05b9362bd4d6
 	github.com/gravitational/trace v1.5.4
-	github.com/mattn/go-sqlite3 v1.14.52
+	github.com/mattn/go-sqlite3 v1.14.53
 	github.com/oapi-codegen/nethttp-middleware v1.3.1
 	github.com/oapi-codegen/runtime v1.8.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/spiffe/go-spiffe/v2 v2.9.0
-	github.com/spiffe/spire-api-sdk v1.15.3
-	github.com/spiffe/spire-controller-manager v0.8.0
+	github.com/spiffe/spire-api-sdk v1.16.0
+	github.com/spiffe/spire-controller-manager v0.8.1
 	github.com/stretchr/testify v1.12.1
 	github.com/swaggest/swgui v1.8.9
 	github.com/uber-go/tally/v4 v4.1.17
@@ -45,13 +45,13 @@ require (
 	go.opentelemetry.io/otel/metric v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
 	go.opentelemetry.io/otel/trace v1.47.0
-	go.temporal.io/api v1.64.1
-	go.temporal.io/sdk v1.50.0
-	go.temporal.io/sdk/contrib/opentelemetry v0.8.1
+	go.temporal.io/api v1.64.3
+	go.temporal.io/sdk v1.51.0
+	go.temporal.io/sdk/contrib/opentelemetry v0.9.0
 	go.temporal.io/sdk/contrib/tally v0.2.0
 	go.uber.org/automaxprocs v1.6.0
-	go.yaml.in/yaml/v4 v4.0.0-rc.7
-	golang.org/x/sync v0.24.0
+	go.yaml.in/yaml/v4 v4.0.0
+	golang.org/x/sync v0.25.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
@@ -126,14 +126,12 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nexus-rpc/nexus-proto-annotations v0.1.1-0.20260629224650-76486e7cc189 // indirect
 	github.com/nexus-rpc/sdk-go v0.7.0 // indirect
-	github.com/oasdiff/yaml v0.1.1 // indirect
-	github.com/oasdiff/yaml3 v0.0.14 // indirect
 	github.com/onsi/gomega v1.44.0 // indirect
-	github.com/pandatix/go-abnf v0.5.3 // indirect
+	github.com/pandatix/go-abnf v0.5.5 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/pquerna/cachecontrol v0.1.0 // indirect
-	github.com/prometheus/common v0.73.1 // indirect
+	github.com/prometheus/common v0.74.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
 	github.com/robfig/cron v1.2.0 // indirect
@@ -141,7 +139,7 @@ require (
 	github.com/russellhaering/goxmldsig v1.6.0 // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 // indirect
 	github.com/spf13/cobra v1.10.2 // indirect
-	github.com/spf13/pflag v1.0.10 // indirect
+	github.com/spf13/pflag v1.1.0 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
 	github.com/tmthrgd/go-hex v0.0.0-20190904060850-447a3041c3bc // indirect
 	github.com/twmb/murmur3 v1.1.8 // indirect
@@ -155,19 +153,19 @@ require (
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	go.yaml.in/yaml/v2 v2.4.4 // indirect
+	go.yaml.in/yaml/v2 v2.4.5 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/crypto v0.59.0 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
-	golang.org/x/net v0.61.0 // indirect
-	golang.org/x/oauth2 v0.37.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
-	golang.org/x/term v0.47.0 // indirect
-	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/net v0.63.0 // indirect
+	golang.org/x/oauth2 v0.38.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/term v0.48.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.5.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20261012220534-4341edf3f941 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20261110000943-09e21b237f2c // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261110000943-09e21b237f2c // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/go-jose/go-jose.v2 v2.6.3 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
